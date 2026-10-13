@@ -35,6 +35,11 @@
 - `CLOSE_TABS_AFTER_READ`: pon `false` si quieres que las pestañas se queden abiertas en vez de cerrarse solas.
 - `CONCURRENCY`: cuántas URLs se procesan en paralelo (por defecto 5). Con listas de decenas o cientos de enlaces, la extensión ya no abre todas las pestañas de golpe: va tomando URLs de la cola de a `CONCURRENCY` a la vez, lo cual evita saturar Chrome y reduce el riesgo de que un sitio te bloquee por exceso de peticiones simultáneas. Puedes subirlo si tu equipo aguanta más carga, o bajarlo si notas lentitud/errores.
 
+## Rendimiento (rama perf/*)
+- Durante cada corrida se bloquean imágenes, video y fuentes vía `declarativeNetRequest` (`BLOCK_HEAVY_RESOURCES`): recorta segundos por página sin afectar data layers (scripts, XHR y documentos nunca se bloquean). Al terminar (o cancelar) la regla se retira sola, incluso si el worker muere a mitad.
+- Calibración con datos reales (368 URLs en 12m05s ≈ 9.9s/URL): si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s); si la máquina aguantó bien, sube `CONCURRENCY` (5→8). Riesgo: perder data layers tardíos.
+- Diferido a propósito: caché entre corridas (en auditoría, saltear URLs es dato rancio — solo tendría sentido como modo opt-in "qué cambió") y pool de tabs (invasivo en el `runQueue` actual para la ganancia que da).
+
 ## Notas
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
 - Requiere permisos amplios (`<all_urls>`) porque debe poder inyectar código en cualquier sitio que pegues.
