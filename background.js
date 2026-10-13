@@ -266,7 +266,7 @@ async function runQueue(job) {
 }
 
 async function processUrl(url, idx, job) {
-  const entry = { url, status: 'pending', digitalData: null, error: null, truncated: false };
+  const entry = { url, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
   let tab;
 
   try {
@@ -278,14 +278,30 @@ async function processUrl(url, idx, job) {
 
     const injection = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      world: 'MAIN', // el mundo "MAIN" comparte el window real de la página, donde vive digitalData
-      func: extractDigitalData,
+      world: 'MAIN', // MAIN world shares the page real window where digitalData and Adobe objects live
+      func: extractPageAnalytics,
       args: [DIGITALDATA_MAX_WAIT_MS, DIGITALDATA_POLL_INTERVAL_MS]
     });
 
-    const result = injection && injection[0] ? injection[0].result : null;
-    entry.digitalData = result;
-    entry.status = result ? 'ok' : 'no-data';
+    const payload = injection && injection[0] ? injection[0].result : null;
+    if (!payload || typeof payload !== 'object') {
+      entry.status = 'no-data';
+    } else {
+      const dd = payload.dd !== undefined ? payload.dd : null;
+      const aa = payload.aa !== undefined ? payload.aa : null;
+      const hasAA = !!(aa && (aa.s || aa.satellite || aa.dataLayer));
+      if (!dd && !hasAA) {
+        entry.status = 'no-data';
+      } else {
+        entry.digitalData = dd;
+        entry.adobeAnalytics = hasAA ? aa : null;
+        entry.status = 'ok';
+        const capped = capEntry(entry, MAX_ENTRY_BYTES);
+        entry.digitalData = capped.digitalData;
+        entry.adobeAnalytics = capped.adobeAnalytics;
+        entry.truncated = capped.truncated;
+      }
+    }
   } catch (e) {
     entry.status = 'error';
     entry.error = e && e.message ? e.message : String(e);
@@ -436,14 +452,36 @@ function storageSet(items) {
 }
 
 // Cap a single result entry so one huge payload cannot exhaust the storage quota.
+// Adobe data is trimmed first (it is supplementary); digitalData is trimmed last.
 function capEntry(entry, maxBytes) {
+  function size() {
+    try {
+      return JSON.stringify({ d: entry.digitalData, a: entry.adobeAnalytics }).length;
+    } catch (e) {
+      return 0;
+    }
+  }
+  if (entry.adobeAnalytics && entry.adobeAnalytics.dataLayer && entry.adobeAnalytics.dataLayer.events &&
+      size() > maxBytes) {
+    const dl = entry.adobeAnalytics.dataLayer;
+    entry.adobeAnalytics.dataLayer = {
+      totalEvents: dl.totalEvents,
+      events: dl.events.slice(0, 10),
+      truncatedEvents: true
+    };
+    entry.truncated = true;
+  }
+  if (entry.adobeAnalytics && size() > maxBytes) {
+    entry.adobeAnalytics = { truncated: true, reason: 'Dropped to fit storage quota' };
+    entry.truncated = true;
+  }
   let serialized = '';
   try {
     serialized = JSON.stringify(entry.digitalData);
   } catch (e) {
     serialized = '';
   }
-  if (serialized && serialized.length > maxBytes) {
+  if (serialized && size() > maxBytes) {
     entry.digitalData = serialized.slice(0, maxBytes);
     entry.truncated = true;
   }
@@ -452,7 +490,7 @@ function capEntry(entry, maxBytes) {
 
 // Esta función se inyecta y se ejecuta DENTRO de la página, no en la extensión.
 // Debe ser autocontenida (sin referencias externas).
-function extractDigitalData(maxWaitMs, intervalMs) {
+function extractPageAnalytics(maxWaitMs, intervalMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     // Algunos sitios exponen la variable como "digitalData" (estándar GTM/Adobe)
@@ -463,6 +501,8 @@ function extractDigitalData(maxWaitMs, intervalMs) {
     // references we depend on up front instead of trusting them at use time.
     const safeStringify = JSON.stringify;
     const safeIsArray = Array.isArray;
+    // Scalar AppMeasurement fields worth keeping; functions and huge internals are dropped.
+    const sFieldPattern = /^(account|pageName|channel|server|pageType|campaign|products|events|purchaseID|transactionID|state|zip|hier\d+|eVar\d+|prop\d+|list\d+|pev\d*|pe)$/;
 
     function sanitize(value, depth, stack) {
       if (depth > 20) throw new Error('digitalData is nested too deeply');
@@ -496,29 +536,85 @@ function extractDigitalData(maxWaitMs, intervalMs) {
 
     function check() {
       const foundName = candidateNames.find((name) => typeof window[name] !== 'undefined');
+      let dd = null;
       if (foundName) {
         try {
           const raw = window[foundName];
-          if (raw === null || typeof raw !== 'object') {
-            resolve(null); // not a digitalData object: keep the typed contract
-            return;
+          if (raw !== null && typeof raw === 'object') {
+            const clone = sanitize(raw, 0, []);
+            if (clone !== null && typeof clone === 'object') {
+              // Validate that the captured serializer can represent the clone.
+              safeStringify(clone);
+              dd = clone;
+            }
           }
-          const clone = sanitize(raw, 0, []);
-          if (clone === null || typeof clone !== 'object') {
-            resolve(null);
-            return;
-          }
-          // Validate that the captured serializer can represent the clone.
-          safeStringify(clone);
-          resolve(clone);
         } catch (e) {
-          resolve(null); // never leak an __error object into the results contract
+          dd = null; // never leak an __error object into the results contract
         }
+      }
+      if (dd) {
+        resolve({ dd: dd, aa: collectAdobe() });
       } else if (Date.now() - start > maxWaitMs) {
-        resolve(null);
+        resolve({ dd: null, aa: collectAdobe() });
       } else {
         setTimeout(check, intervalMs);
       }
+    }
+
+    // Snapshot of Adobe Analytics state: AppMeasurement summary, Launch metadata
+    // and adobeDataLayer events. Best effort; returns null when nothing is found.
+    function collectAdobe() {
+      let s = null;
+      let satellite = null;
+      let dataLayer = null;
+      try {
+        const sRaw = window.s;
+        if (sRaw && typeof sRaw === 'object') {
+          const out = {};
+          const keys = Object.keys(sRaw);
+          for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (!sFieldPattern.test(k)) continue;
+            const v = sanitize(sRaw[k], 1, []);
+            if (v !== undefined && v !== '') out[k] = v;
+          }
+          if (Object.keys(out).length) s = out;
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const sat = window._satellite;
+        if (sat && typeof sat === 'object') {
+          const info = {};
+          try {
+            if (sat.property && sat.property.name) info.property = String(sat.property.name);
+          } catch (e) { /* ignore */ }
+          try {
+            if (sat.environment && sat.environment.stage) info.environment = String(sat.environment.stage);
+          } catch (e) { /* ignore */ }
+          try {
+            if (sat.buildInfo && typeof sat.buildInfo === 'object') {
+              const b = sanitize(sat.buildInfo, 0, []);
+              if (b && typeof b === 'object') info.buildInfo = b;
+            }
+          } catch (e) { /* ignore */ }
+          if (Object.keys(info).length) satellite = info;
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const adl = window.adobeDataLayer;
+        if (adl && typeof adl.length === 'number') {
+          const clean = sanitize(Array.prototype.slice.call(adl), 0, []);
+          if (safeIsArray(clean) && clean.length) {
+            dataLayer = {
+              totalEvents: clean.length,
+              events: clean.length > 50 ? clean.slice(0, 50) : clean,
+              truncatedEvents: clean.length > 50
+            };
+          }
+        }
+      } catch (e) { /* ignore */ }
+      if (!s && !satellite && !dataLayer) return null;
+      return { s: s, satellite: satellite, dataLayer: dataLayer };
     }
 
     check();
