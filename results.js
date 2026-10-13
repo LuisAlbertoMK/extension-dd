@@ -177,16 +177,29 @@ document.getElementById('downloadSummary').addEventListener('click', async () =>
   URL.revokeObjectURL(url);
 });
 
-document.getElementById('downloadJson').addEventListener('click', async () => {
-  const { ddResults } = await chrome.storage.local.get('ddResults');
-  const combined = buildCombinedJson(ddResults || {});
-  const blob = new Blob([JSON.stringify(combined, null, 2)], { type: 'application/json' });
+function downloadFile(name, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `digitalData-resultados-${Date.now()}.json`;
+  a.download = name;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+document.getElementById('downloadJson').addEventListener('click', async () => {
+  const { ddResults } = await chrome.storage.local.get('ddResults');
+  downloadFile(`digitalData-resultados-${Date.now()}.json`, buildCombinedJson(ddResults || {}));
+});
+
+document.getElementById('downloadDD').addEventListener('click', async () => {
+  const { ddResults } = await chrome.storage.local.get('ddResults');
+  downloadFile(`digitalData-dd-${Date.now()}.json`, buildDDJson(ddResults || {}));
+});
+
+document.getElementById('downloadAA').addEventListener('click', async () => {
+  const { ddResults } = await chrome.storage.local.get('ddResults');
+  downloadFile(`digitalData-aa-${Date.now()}.json`, buildAAJson(ddResults || {}));
 });
 
 document.getElementById('copyJson').addEventListener('click', async () => {

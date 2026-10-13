@@ -3,7 +3,8 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { buildCombinedJson } = require('../lib/results.js');
-const { validateExport, EXPORT_STATUS } = require('../lib/schema.js');
+const { buildDDJson, buildAAJson } = require('../lib/results.js');
+const { validateExport, validateDDExport, validateAAExport, EXPORT_STATUS } = require('../lib/schema.js');
 
 function sampleResults() {
   return {
@@ -54,5 +55,25 @@ describe('export contract', () => {
     assert.ok(validateExport([{ ...okEntry, digitalData: 42 }]).some((v) => v.includes('.digitalData')));
     assert.ok(validateExport([{ ...okEntry, error: 5 }]).some((v) => v.includes('.error')));
     assert.ok(validateExport([{ ...okEntry, url: '' }]).some((v) => v.includes('.url')));
+  });
+
+  it('rejects non-array payloads', () => {
+    assert.deepEqual(validateExport({}), ['export must be an array']);
+  });
+});
+
+describe('split-view contracts', () => {
+  it('DD and AA exports validate against their own contracts', () => {
+    const results = sampleResults();
+    assert.deepEqual(validateDDExport(buildDDJson(results)), []);
+    assert.deepEqual(validateAAExport(buildAAJson(results)), []);
+  });
+
+  it('split views reject foreign payloads', () => {
+    const results = sampleResults();
+    const [ddEntry] = buildDDJson(results);
+    const [aaEntry] = buildAAJson(results);
+    assert.ok(validateAAExport([ddEntry]).some((v) => v.includes('missing required field "adobeAnalytics"')));
+    assert.ok(validateDDExport([aaEntry]).some((v) => v.includes('missing required field "digitalData"')));
   });
 });
