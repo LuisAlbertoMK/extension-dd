@@ -17,6 +17,12 @@ const TAB_LOAD_TIMEOUT_MS = 25000;
 // Per-entry cap so a single huge digitalData payload cannot blow the storage quota.
 const MAX_ENTRY_BYTES = 256 * 1024;
 
+// --- Throughput tuning (calibrate with real runs, e.g. 368 URLs in 12m05s) ---
+// Blocking images/media/fonts while a job runs cuts load time without
+// affecting data layers (scripts, XHR and documents are never blocked).
+const BLOCK_HEAVY_RESOURCES = true;
+const PERF_DNR_RULE_ID = 10;
+
 // Ford AEM bypass: header + cookie required so wwwac.*.brand*.ford.com pages load instead of blocking.
 const FORD_URL_REGEX = /^https:\/\/wwwac\..*\.brand.*\.ford\.com\/.*/i;
 const FORD_EDGE_HEADER = 'X-AEM-Edge-Key';
@@ -115,6 +121,36 @@ async function ensureFordCookie(url) {
 
 // ---- Job lifecycle ----
 
+// Enables/disables the heavy-resource block while a job runs. Dynamic rules
+// persist across service-worker restarts, so every enable path has a matching
+// disable (finalize, cancel, worker startup).
+async function ensurePerfRules(enable) {
+  try {
+    if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
+    if (enable && BLOCK_HEAVY_RESOURCES) {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [PERF_DNR_RULE_ID],
+        addRules: [{
+          id: PERF_DNR_RULE_ID,
+          priority: 1,
+          action: { type: 'block' },
+          condition: {
+            urlFilter: '|http*',
+            resourceTypes: ['image', 'media', 'font']
+          }
+        }]
+      });
+    } else {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [PERF_DNR_RULE_ID],
+        addRules: []
+      });
+    }
+  } catch (e) {
+    console.warn('DigitalData: failed to update perf rules', e);
+  }
+}
+
 async function startJob(urls) {
   if (activeJob) return { ok: false, reason: 'already-running' };
   if (!Array.isArray(urls) || !urls.length) return { ok: false, reason: 'no-urls' };
@@ -177,6 +213,7 @@ function launchJob(job) {
 async function finalizeJob(job, openResults) {
   if (activeJob === job) activeJob = null;
   const cancelled = job.handle.cancelled;
+  await ensurePerfRules(false).catch(() => {});
 
   // Drop any pending throttled flush and persist the final accumulated snapshot
   // so a late suspend cannot lose the last batch of results.
@@ -236,6 +273,7 @@ function firstIncompleteIndex(urls, results) {
 async function runQueue(job) {
   const { record, handle } = job;
   const urls = record.urls;
+  await ensurePerfRules(true).catch(() => {});
 
   function claim() {
     while (record.nextIndex < urls.length) {
@@ -590,3 +628,4 @@ function extractPageAnalytics(maxWaitMs, intervalMs) {
 // Attempt to resume an interrupted job when the worker (re)starts.
 maybeResume().catch(() => {});
 ensureFordRequestRules().catch(() => {});
+ensurePerfRules(false).catch(() => {}); // drop stale blocks from a killed run
