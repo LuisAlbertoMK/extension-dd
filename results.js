@@ -70,12 +70,16 @@ async function loadResults() {
     if (entry.status === 'error') {
       pre.textContent = 'Error: ' + entry.error;
     } else if (entry.status === 'no-data') {
-      pre.textContent = 'No se encontró window.digitalData en esta página.';
-    } else if (entry.truncated) {
-      pre.textContent = String(entry.digitalData) +
+      pre.textContent = 'No se encontró window.digitalData ni datos de Adobe Analytics en esta página.';
+    } else if (entry.truncated && typeof entry.digitalData === 'string') {
+      pre.textContent = entry.digitalData +
         '\n\n[... contenido truncado por límite de almacenamiento ...]';
     } else {
       pre.textContent = JSON.stringify(entry.digitalData, null, 2);
+    }
+    if (entry.adobeAnalytics) {
+      pre.textContent += '\n\n--- Adobe Analytics ---\n' +
+        JSON.stringify(entry.adobeAnalytics, null, 2);
     }
 
     card.appendChild(header);
@@ -101,6 +105,7 @@ function buildCombinedJson(results) {
     status: entry.status,
     truncated: !!entry.truncated,
     digitalData: entry.digitalData,
+    adobeAnalytics: entry.adobeAnalytics || null,
     error: entry.error
   }));
 }

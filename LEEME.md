@@ -16,6 +16,7 @@
    se define de forma asíncrona) y cerrará la pestaña automáticamente.
 5. Al terminar todas, se abre sola la pestaña "Ver resultados" con:
    - Una tarjeta por URL con su `digitalData` en JSON.
+   - Debajo, sección "Adobe Analytics" con resumen de `window.s` (pageName, events, eVars/props), metadata de `_satellite` (property, environment) y eventos de `adobeDataLayer` (hasta 50 por página).
    - Botón para descargar todo combinado en un único archivo `.json`.
    - Botón para copiar el JSON combinado al portapapeles.
 
