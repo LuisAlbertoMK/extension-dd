@@ -19,6 +19,10 @@
    - Debajo, sección "Adobe Analytics" con resumen de `window.s` (pageName, events, eVars/props), metadata de `_satellite` (property, environment) y eventos de `adobeDataLayer` (hasta 50 por página).
    - Botón para descargar todo combinado en un único archivo `.json`.
    - Botón para copiar el JSON combinado al portapapeles.
+   - Botón "Descargar resumen": JSON compacto con totales por estado
+     (ok / sin digitalData / error), top 5 errores agrupados, truncados,
+     conteo con Adobe Analytics y tiempos — para evaluar la corrida sin
+     scrollear las 368 tarjetas.
 
 ## Configuración opcional (background.js)
 - `POST_LOAD_WAIT_MS`: espera extra tras cargar la página antes de buscar el objeto (por defecto 1.5s).

@@ -12,7 +12,16 @@
     padding: 24px 32px 60px;
   }
   h1 { font-size: 20px; margin-bottom: 4px; }
-  #summary { color: #9ca3af; font-size: 13px; margin-bottom: 18px; }
+  #summary { color: #9ca3af; font-size: 13px; margin-bottom: 10px; }
+  #stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    font-size: 12px;
+    color: #9ca3af;
+    margin-bottom: 18px;
+  }
+  .stat-row b { color: #e5e7eb; font-weight: 600; }
   .toolbar {
     display: flex;
     gap: 10px;
@@ -79,8 +88,10 @@
 <body>
   <h1>Resultados combinados de digitalData</h1>
   <div id="summary"></div>
+  <div id="stats"></div>
   <div class="toolbar">
     <button id="downloadJson">Descargar JSON combinado</button>
+    <button id="downloadSummary" class="secondary">Descargar resumen</button>
     <button id="copyJson" class="secondary">Copiar al portapapeles</button>
     <button id="refresh" class="secondary">Actualizar</button>
   </div>
