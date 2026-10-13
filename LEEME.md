@@ -30,7 +30,14 @@
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
 - Requiere permisos amplios (`<all_urls>`) porque debe poder inyectar código en cualquier sitio que pegues.
 
-## Configuración local (Ford AEM, opcional)
-1. Copia `config.example.js` a `config.local.js` (ese archivo está en `.gitignore` y nunca se sube).
+## Tests (node, sin dependencias)
+Las funciones puras viven en `lib/` y se prueban con el runner nativo:
+- `npm test` — 25 tests (urls, formato, resultados, quota, contrato de export).
+- `node --test --experimental-test-coverage test/` — medición (~99% líneas en `lib/`).
+El `test/contract.test.js` valida el schema que consumen importadores externos
+(p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de
+romper la auditoría en silencio.
+
+## Configuración local (Ford AEM, opcional)1. Copia `config.example.js` a `config.local.js` (ese archivo está en `.gitignore` y nunca se sube).
 2. Completa tus valores reales (`edgeValue`, `cookieValue`).
 3. Recarga la extensión. Sin ese archivo, el bypass de Ford queda desactivado y todo lo demás funciona igual.
