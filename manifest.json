@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "DigitalData Multi-URL Extractor",
+  "version": "1.0.0",
+  "description": "Abre varias URLs en pestañas, extrae window.digitalData de cada una y muestra un resultado combinado.",
+  "permissions": ["tabs", "scripting", "storage", "cookies", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "DigitalData Extractor"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

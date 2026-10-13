@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<title>DigitalData Extractor</title>
+<style>
+  body {
+    width: 340px;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    padding: 14px;
+    background: #111827;
+    color: #f3f4f6;
+  }
+  h1 {
+    font-size: 15px;
+    margin: 0 0 10px;
+    color: #fff;
+  }
+  textarea {
+    width: 100%;
+    height: 130px;
+    box-sizing: border-box;
+    background: #1f2937;
+    color: #f3f4f6;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+    resize: vertical;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  button {
+    flex: 1;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #start {
+    background: #4f46e5;
+    color: #fff;
+    font-weight: 600;
+  }
+  #start:hover { background: #4338ca; }
+  #viewResults {
+    background: #374151;
+    color: #f3f4f6;
+  }
+  #viewResults:hover { background: #4b5563; }
+  button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  #status {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #9ca3af;
+    min-height: 16px;
+  }
+  .hint {
+    font-size: 11px;
+    color: #6b7280;
+    margin-top: 6px;
+  }
+</style>
+</head>
+<body>
+  <h1>DigitalData Extractor</h1>
+  <textarea id="urls" placeholder="https://ejemplo.com/pagina1&#10;https://ejemplo.com/pagina2&#10;https://ejemplo.com/pagina3"></textarea>
+  <div class="hint">Pega una URL por línea.</div>
+  <div class="row">
+    <button id="start">Abrir y analizar</button>
+    <button id="viewResults">Ver resultados</button>
+  </div>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
