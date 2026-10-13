@@ -23,6 +23,8 @@
      (ok / sin digitalData / error), top 5 errores agrupados, truncados,
      conteo con Adobe Analytics y tiempos — para evaluar la corrida sin
      scrollear las 368 tarjetas.
+   - El resumen separa prod vs preview (mismo patrón del preflight) y el
+     conteo de errores abre un modal con URL + mensaje de cada fallo.
 
 ## Configuración opcional (background.js)
 - `POST_LOAD_WAIT_MS`: espera extra tras cargar la página antes de buscar el objeto (por defecto 1.5s).

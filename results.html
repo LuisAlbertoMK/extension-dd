@@ -22,6 +22,53 @@
     margin-bottom: 18px;
   }
   .stat-row b { color: #e5e7eb; font-weight: 600; }
+  .link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #93c5fd;
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 50;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 40px 16px;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal-box {
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 8px;
+    max-width: 720px;
+    width: 100%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    background: #111827;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  #modalList { overflow: auto; padding: 8px 14px 14px; }
+  .modal-item {
+    border-bottom: 1px solid #374151;
+    padding: 8px 0;
+    font-size: 12px;
+  }
+  .modal-error { color: #fecaca; margin-top: 4px; word-break: break-all; }
   .toolbar {
     display: flex;
     gap: 10px;
@@ -96,7 +143,17 @@
     <button id="refresh" class="secondary">Actualizar</button>
   </div>
   <div id="list"></div>
+  <div id="modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span>Detalle de errores</span>
+        <button id="modalClose" class="secondary">Cerrar</button>
+      </div>
+      <div id="modalList"></div>
+    </div>
+  </div>
   <script src="lib/format.js"></script>
+  <script src="lib/urls.js"></script>
   <script src="lib/results.js"></script>
   <script src="results.js"></script>
 </body>
