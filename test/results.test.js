@@ -50,14 +50,15 @@ describe('buildCombinedJson', () => {
 
 describe('buildSummary', () => {
   const ordered = [
-    { idx: 0, entry: { status: 'ok', truncated: false, adobeAnalytics: { s: {} }, error: null } },
-    { idx: 1, entry: { status: 'no-data', truncated: false, adobeAnalytics: null, error: null } },
-    { idx: 2, entry: { status: 'error', truncated: false, adobeAnalytics: null, error: 'Timed out waiting for page load' } },
-    { idx: 3, entry: { status: 'error', truncated: true, adobeAnalytics: null, error: 'Timed out waiting for page load' } }
+    { idx: 0, entry: { url: 'https://shop.example/m', status: 'ok', truncated: false, adobeAnalytics: { s: {} }, error: null } },
+    { idx: 1, entry: { url: 'https://shop.example/n', status: 'no-data', truncated: false, adobeAnalytics: null, error: null } },
+    { idx: 2, entry: { url: 'https://preview.example/d', status: 'error', truncated: false, adobeAnalytics: null, error: 'Timed out waiting for page load' } },
+    { idx: 3, entry: { url: 'https://preview.example/e', status: 'error', truncated: true, adobeAnalytics: null, error: 'Timed out waiting for page load' } }
   ];
+  const classify = (url) => String(url).includes('preview') ? 'preview' : 'prod';
 
   it('counts statuses, truncated, AA and groups top errors', () => {
-    const s = buildSummary(ordered, { startedAt: 0, finishedAt: 4000 });
+    const s = buildSummary(ordered, { startedAt: 0, finishedAt: 4000 }, classify);
     assert.equal(s.total, 4);
     assert.deepEqual(s.byStatus, { ok: 1, 'no-data': 1, error: 2, pending: 0 });
     assert.equal(s.truncated, 1);
@@ -65,6 +66,18 @@ describe('buildSummary', () => {
     assert.equal(s.elapsedMs, 4000);
     assert.equal(s.avgMsPerUrl, 1000);
     assert.deepEqual(s.topErrors, [{ message: 'Timed out waiting for page load', count: 2 }]);
+  });
+
+  it('splits counts by prod vs preview', () => {
+    const s = buildSummary(ordered, { startedAt: 0, finishedAt: 4000 }, classify);
+    assert.deepEqual(s.byEnv.prod, { total: 2, ok: 1, 'no-data': 1, error: 0 });
+    assert.deepEqual(s.byEnv.preview, { total: 2, ok: 0, 'no-data': 0, error: 2 });
+  });
+
+  it('defaults every URL to prod without a classifier', () => {
+    const s = buildSummary(ordered, { startedAt: 0, finishedAt: 4000 });
+    assert.equal(s.byEnv.prod.total, 4);
+    assert.equal(s.byEnv.preview.total, 0);
   });
 
   it('handles empty results and missing time bounds', () => {

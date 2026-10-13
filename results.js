@@ -1,6 +1,15 @@
 const listEl = document.getElementById('list');
 const summaryEl = document.getElementById('summary');
 const statsEl = document.getElementById('stats');
+let lastEntries = [];
+
+function classifyEnv(url) {
+  try {
+    return (typeof isPreviewUrl === 'function' && isPreviewUrl(url)) ? 'preview' : 'prod';
+  } catch (e) {
+    return 'prod';
+  }
+}
 
 function badgeClass(status) {
   return status || 'pending';
@@ -35,7 +44,8 @@ async function loadResults() {
   renderStats(buildSummary(entries, {
     startedAt: ddStartedAt,
     finishedAt: ddJobRunning ? Date.now() : ddFinishedAt
-  }));
+  }, classifyEnv));
+  lastEntries = entries;
 
   if (!entries.length) {
     listEl.innerHTML = '<div class="empty">Todavía no hay resultados. Ejecuta un análisis desde el popup de la extensión.</div>';
@@ -101,16 +111,61 @@ function renderStats(summary) {
   row('OK', `${summary.byStatus.ok}${pct(summary.byStatus.ok)}`);
   row('Sin digitalData', `${summary.byStatus['no-data']}${pct(summary.byStatus['no-data'])}`);
   row('Errores', `${summary.byStatus.error}${pct(summary.byStatus.error)}`);
+  row('Prod OK / sin DD / errores',
+    `${summary.byEnv.prod.ok} / ${summary.byEnv.prod['no-data']} / ${summary.byEnv.prod.error}`);
+  row('Preview OK / sin DD / errores',
+    `${summary.byEnv.preview.ok} / ${summary.byEnv.preview['no-data']} / ${summary.byEnv.preview.error}`);
   row('Truncados', String(summary.truncated));
   row('Con Adobe Analytics', `${summary.adobe.with} / ${summary.total}`);
   summary.topErrors.forEach((e) => row(`Top error ×${e.count}`, e.message));
+  if (summary.byStatus.error > 0) {
+    const btn = document.createElement('button');
+    btn.className = 'link-btn';
+    btn.textContent = `Ver detalle de los ${summary.byStatus.error} errores`;
+    btn.addEventListener('click', openErrorModal);
+    const div = document.createElement('div');
+    div.className = 'stat-row';
+    div.appendChild(btn);
+    statsEl.appendChild(div);
+  }
+}
+
+// Modal with one row per failed URL (textContent only: URLs and errors are untrusted).
+function openErrorModal() {
+  const list = document.getElementById('modalList');
+  list.innerHTML = '';
+  const errs = lastEntries.filter(({ entry }) => entry && entry.status === 'error');
+  if (!errs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Sin errores en esta corrida.';
+    list.appendChild(empty);
+  }
+  errs.forEach(({ entry }) => {
+    const item = document.createElement('div');
+    item.className = 'modal-item';
+    const url = document.createElement('div');
+    url.className = 'url';
+    url.textContent = entry.url;
+    const msg = document.createElement('div');
+    msg.className = 'modal-error';
+    msg.textContent = entry.error || 'unknown';
+    item.appendChild(url);
+    item.appendChild(msg);
+    list.appendChild(item);
+  });
+  document.getElementById('modal').classList.add('open');
+}
+
+function closeErrorModal() {
+  document.getElementById('modal').classList.remove('open');
 }
 
 document.getElementById('downloadSummary').addEventListener('click', async () => {
   const { ddResults, ddTotal, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
     'ddResults', 'ddTotal', 'ddStartedAt', 'ddFinishedAt'
   ]);
-  const summary = buildSummary(orderedResults(ddResults || {}), { startedAt: ddStartedAt, finishedAt: ddFinishedAt });
+  const summary = buildSummary(orderedResults(ddResults || {}), { startedAt: ddStartedAt, finishedAt: ddFinishedAt }, classifyEnv);
   summary.generatedAt = new Date().toISOString();
   summary.expectedTotal = ddTotal || summary.total;
   const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
@@ -145,6 +200,14 @@ document.getElementById('copyJson').addEventListener('click', async () => {
 });
 
 document.getElementById('refresh').addEventListener('click', loadResults);
+
+document.getElementById('modalClose').addEventListener('click', closeErrorModal);
+document.getElementById('modal').addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'modal') closeErrorModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeErrorModal();
+});
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local') loadResults();
