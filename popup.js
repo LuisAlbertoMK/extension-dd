@@ -3,41 +3,7 @@ const statusEl = document.getElementById('status');
 const startBtn = document.getElementById('start');
 const viewBtn = document.getElementById('viewResults');
 
-function parseUrls(raw) {
-  const seen = new Set();
-  const urls = [];
-  raw.split('\n').forEach((line) => {
-    const s = line.trim();
-    if (!s) return;
-    // Reject an explicit non-http(s) scheme instead of force-prefixing it.
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s) && !/^https?:\/\//i.test(s)) return;
-    const candidate = /^https?:\/\//i.test(s) ? s : 'https://' + s;
-    let parsed;
-    try {
-      parsed = new URL(candidate);
-    } catch (e) {
-      return; // ignore malformed URLs
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
-    const normalized = parsed.href;
-    if (seen.has(normalized)) return; // dedupe
-    seen.add(normalized);
-    urls.push(normalized);
-  });
-  return urls;
-}
-
-// Matches preview/staging/author hosts. Extend with team-specific patterns as needed.
-const PREVIEW_PATTERN = /preview|author[-.]|stage|dev[-.]|test[-.]|localhost|127\.0\.0\.1|\.corp|aem.*preview|hlx.*preview/i;
-
-function isPreviewUrl(url) {
-  try {
-    const u = new URL(url);
-    return PREVIEW_PATTERN.test(u.hostname) || PREVIEW_PATTERN.test(u.href);
-  } catch (e) {
-    return false;
-  }
-}
+// parseUrls, isPreviewUrl and formatElapsed live in lib/ (loaded before this script).
 
 async function refreshStatus() {
   const { ddJobRunning, ddTotal, ddResults, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
@@ -57,14 +23,6 @@ async function refreshStatus() {
   } else {
     statusEl.textContent = '';
   }
-}
-
-function formatElapsed(start, end) {
-  if (!start || !end || end < start) return '—';
-  const s = (end - start) / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${(s % 60).toFixed(0)}s`;
 }
 
 // Live ticking counter while the job runs

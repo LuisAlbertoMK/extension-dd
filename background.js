@@ -1,5 +1,6 @@
 // Optional local overrides (untracked). Copy config.example.js to config.local.js.
 try { importScripts('config.local.js'); } catch (e) { /* no local config: Ford bypass stays disabled */ }
+importScripts('lib/quota.js'); // capEntry (pure, also covered by node tests)
 
 // Tiempo extra tras "complete" para dejar que scripts async (analytics) definan digitalData
 const POST_LOAD_WAIT_MS = 1500;
@@ -451,42 +452,7 @@ function storageSet(items) {
   });
 }
 
-// Cap a single result entry so one huge payload cannot exhaust the storage quota.
-// Adobe data is trimmed first (it is supplementary); digitalData is trimmed last.
-function capEntry(entry, maxBytes) {
-  function size() {
-    try {
-      return JSON.stringify({ d: entry.digitalData, a: entry.adobeAnalytics }).length;
-    } catch (e) {
-      return 0;
-    }
-  }
-  if (entry.adobeAnalytics && entry.adobeAnalytics.dataLayer && entry.adobeAnalytics.dataLayer.events &&
-      size() > maxBytes) {
-    const dl = entry.adobeAnalytics.dataLayer;
-    entry.adobeAnalytics.dataLayer = {
-      totalEvents: dl.totalEvents,
-      events: dl.events.slice(0, 10),
-      truncatedEvents: true
-    };
-    entry.truncated = true;
-  }
-  if (entry.adobeAnalytics && size() > maxBytes) {
-    entry.adobeAnalytics = { truncated: true, reason: 'Dropped to fit storage quota' };
-    entry.truncated = true;
-  }
-  let serialized = '';
-  try {
-    serialized = JSON.stringify(entry.digitalData);
-  } catch (e) {
-    serialized = '';
-  }
-  if (serialized && size() > maxBytes) {
-    entry.digitalData = serialized.slice(0, maxBytes);
-    entry.truncated = true;
-  }
-  return entry;
-}
+// capEntry is provided by lib/quota.js (imported at the top of this worker).
 
 // Esta función se inyecta y se ejecuta DENTRO de la página, no en la extensión.
 // Debe ser autocontenida (sin referencias externas).

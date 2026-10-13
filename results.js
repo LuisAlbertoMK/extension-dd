@@ -14,18 +14,7 @@ function statusLabel(status) {
   }
 }
 
-// Results are keyed as `${idx}__${url}`; sort by the numeric index so the list
-// always appears in the order the URLs were submitted.
-function entryIndex(key) {
-  const n = parseInt(key, 10);
-  return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n;
-}
-
-function orderedResults(results) {
-  return Object.keys(results)
-    .map((key) => ({ idx: entryIndex(key), entry: results[key] }))
-    .sort((a, b) => a.idx - b.idx);
-}
+// entryIndex, orderedResults, buildCombinedJson and formatElapsed live in lib/.
 
 async function loadResults() {
   const { ddResults, ddTotal, ddJobRunning, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
@@ -86,28 +75,6 @@ async function loadResults() {
     card.appendChild(pre);
     listEl.appendChild(card);
   });
-}
-
-function formatElapsed(start, end) {
-  if (!start || !end || end < start) return '—';
-  const s = (end - start) / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${(s % 60).toFixed(0)}s`;
-}
-
-function buildCombinedJson(results) {
-  // Exported as an array (not an object keyed by URL) so duplicate URLs and the
-  // original submission order are preserved.
-  return orderedResults(results).map(({ idx, entry }) => ({
-    index: idx,
-    url: entry.url,
-    status: entry.status,
-    truncated: !!entry.truncated,
-    digitalData: entry.digitalData,
-    adobeAnalytics: entry.adobeAnalytics || null,
-    error: entry.error
-  }));
 }
 
 document.getElementById('downloadJson').addEventListener('click', async () => {
