@@ -18,6 +18,9 @@
    - Una tarjeta por URL con su `digitalData` en JSON.
    - Debajo, sección "Adobe Analytics" con resumen de `window.s` (pageName, events, eVars/props), metadata de `_satellite` (property, environment) y eventos de `adobeDataLayer` (hasta 50 por página).
    - Botón para descargar todo combinado en un único archivo `.json`.
+   - Botones "Descargar DD" / "Descargar AA": vistas separadas con el mismo
+     orden e índices, cada una con status honesto por vista, para que agentes
+     o validadores independientes consuman solo lo suyo sin contaminarse.
    - Botón para copiar el JSON combinado al portapapeles.
    - Botón "Descargar resumen": JSON compacto con totales por estado
      (ok / sin digitalData / error), top 5 errores agrupados, truncados,

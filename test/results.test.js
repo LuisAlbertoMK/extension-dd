@@ -1,7 +1,7 @@
 // Unit tests for lib/results.js — run with: npm test
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { entryIndex, orderedResults, buildCombinedJson, buildSummary } = require('../lib/results.js');
+const { entryIndex, orderedResults, buildCombinedJson, buildDDJson, buildAAJson, buildSummary } = require('../lib/results.js');
 
 describe('entryIndex', () => {
   it('parses the numeric prefix of storage keys', () => {
@@ -45,6 +45,35 @@ describe('buildCombinedJson', () => {
     });
     assert.equal(out[0].adobeAnalytics, null);
     assert.equal(out[0].truncated, false);
+  });
+});
+
+describe('buildDDJson / buildAAJson', () => {
+  const results = {
+    '0__https://x.example/a': { url: 'https://x.example/a', status: 'ok', digitalData: { p: 1 }, adobeAnalytics: { s: {} }, error: null },
+    '1__https://x.example/b': { url: 'https://x.example/b', status: 'ok', digitalData: null, adobeAnalytics: { s: {} }, error: null },
+    '2__https://x.example/c': { url: 'https://x.example/c', status: 'error', digitalData: null, adobeAnalytics: null, error: 'boom' }
+  };
+
+  it('DD view keeps DD payload with view-local status', () => {
+    const out = buildDDJson(results);
+    assert.deepEqual(out.map((r) => r.status), ['ok', 'no-data', 'error']);
+    assert.ok(!('adobeAnalytics' in out[0]));
+    assert.deepEqual(out[0].digitalData, { p: 1 });
+  });
+
+  it('AA view keeps AA payload with view-local status', () => {
+    const out = buildAAJson(results);
+    assert.deepEqual(out.map((r) => r.status), ['ok', 'ok', 'error']);
+    assert.ok(!('digitalData' in out[0]));
+    assert.deepEqual(out[0].adobeAnalytics, { s: {} });
+  });
+
+  it('both views share index space and order with the combined export', () => {
+    const { buildCombinedJson } = require('../lib/results.js');
+    const idx = (arr) => arr.map((r) => r.index);
+    assert.deepEqual(idx(buildDDJson(results)), idx(buildCombinedJson(results)));
+    assert.deepEqual(idx(buildAAJson(results)), idx(buildCombinedJson(results)));
   });
 });
 
