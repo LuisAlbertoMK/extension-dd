@@ -1,7 +1,7 @@
 // Unit tests for lib/results.js — run with: npm test
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { entryIndex, orderedResults, buildCombinedJson } = require('../lib/results.js');
+const { entryIndex, orderedResults, buildCombinedJson, buildSummary } = require('../lib/results.js');
 
 describe('entryIndex', () => {
   it('parses the numeric prefix of storage keys', () => {
@@ -45,5 +45,33 @@ describe('buildCombinedJson', () => {
     });
     assert.equal(out[0].adobeAnalytics, null);
     assert.equal(out[0].truncated, false);
+  });
+});
+
+describe('buildSummary', () => {
+  const ordered = [
+    { idx: 0, entry: { status: 'ok', truncated: false, adobeAnalytics: { s: {} }, error: null } },
+    { idx: 1, entry: { status: 'no-data', truncated: false, adobeAnalytics: null, error: null } },
+    { idx: 2, entry: { status: 'error', truncated: false, adobeAnalytics: null, error: 'Timed out waiting for page load' } },
+    { idx: 3, entry: { status: 'error', truncated: true, adobeAnalytics: null, error: 'Timed out waiting for page load' } }
+  ];
+
+  it('counts statuses, truncated, AA and groups top errors', () => {
+    const s = buildSummary(ordered, { startedAt: 0, finishedAt: 4000 });
+    assert.equal(s.total, 4);
+    assert.deepEqual(s.byStatus, { ok: 1, 'no-data': 1, error: 2, pending: 0 });
+    assert.equal(s.truncated, 1);
+    assert.deepEqual(s.adobe, { with: 1, without: 3 });
+    assert.equal(s.elapsedMs, 4000);
+    assert.equal(s.avgMsPerUrl, 1000);
+    assert.deepEqual(s.topErrors, [{ message: 'Timed out waiting for page load', count: 2 }]);
+  });
+
+  it('handles empty results and missing time bounds', () => {
+    const s = buildSummary([], {});
+    assert.equal(s.total, 0);
+    assert.equal(s.elapsedMs, null);
+    assert.equal(s.avgMsPerUrl, null);
+    assert.deepEqual(s.topErrors, []);
   });
 });
