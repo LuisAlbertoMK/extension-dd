@@ -305,7 +305,7 @@ async function runQueue(job) {
 }
 
 async function processUrl(url, idx, job) {
-  const entry = { url, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
+  const entry = { url, finalUrl: null, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
   let tab;
 
   try {
@@ -313,6 +313,13 @@ async function processUrl(url, idx, job) {
     tab = await chrome.tabs.create({ url, active: false });
     trackTab(job, tab.id);
     await waitForTabComplete(tab.id, TAB_LOAD_TIMEOUT_MS);
+    // Capture the post-redirect URL: the data layer belongs to THIS page,
+    // which may differ from the requested URL (locale/preview redirects,
+    // chrome-error pages). Best effort; stays null if the tab is gone.
+    try {
+      const current = await chrome.tabs.get(tab.id);
+      if (current && current.url) entry.finalUrl = current.url;
+    } catch (e) { /* tab already gone */ }
     await sleep(POST_LOAD_WAIT_MS);
 
     const injection = await chrome.scripting.executeScript({
