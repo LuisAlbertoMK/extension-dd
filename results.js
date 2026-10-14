@@ -88,6 +88,12 @@ async function loadResults() {
     }
 
     card.appendChild(header);
+    if (entry.finalUrl && entry.finalUrl !== entry.url) {
+      const redir = document.createElement('div');
+      redir.className = 'redirect';
+      redir.textContent = '→ ' + entry.finalUrl;
+      card.appendChild(redir);
+    }
     card.appendChild(pre);
     listEl.appendChild(card);
   });

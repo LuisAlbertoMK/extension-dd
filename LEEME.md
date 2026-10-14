@@ -40,6 +40,10 @@
 - Calibración con datos reales (368 URLs en 12m05s ≈ 9.9s/URL): si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s); si la máquina aguantó bien, sube `CONCURRENCY` (5→8). Riesgo: perder data layers tardíos.
 - Diferido a propósito: caché entre corridas (en auditoría, saltear URLs es dato rancio — solo tendría sentido como modo opt-in "qué cambió") y pool de tabs (invasivo en el `runQueue` actual para la ganancia que da).
 
+## Verdad del dato (rama perf/*)
+- Cada entry guarda `finalUrl` (URL post-redirect, o `chrome-error://` si la página nunca cargó): el data layer pertenece a ESA página. Si difiere de la pedida, la tarjeta lo muestra en amarillo.
+- Paridad entre ramas: corre el mismo set en ambas, descarga el DD de cada una y compara con `npm run parity -- base-dd.json perf-dd.json` (exit 0 = paridad, 1 = divergencia). Adoptar perf solo con paridad total.
+
 ## Notas
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
 - Requiere permisos amplios (`<all_urls>`) porque debe poder inyectar código en cualquier sitio que pegues.
