@@ -91,6 +91,18 @@ test('missing arguments and unreadable input exit 2', () => {
   assert.match(run(base, noEnv).stdout, /missing byEnv\/adobe/);
 });
 
+test('an unfinished run exits 1 and the verdict names that reason, not the list', () => {
+  const full = summary({ ok: 110, noData: 229, error: 29 });
+  const base = write('base5.json', { ...full, expectedTotal: 1106 });
+  const cand = write('cand5.json', { ...summary({ ok: 110, noData: 220, error: 30 }), expectedTotal: 1106 });
+
+  const result = run(base, cand);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /VERDICT: INVALID INPUT - a run did not finish the list/);
+  assert.doesNotMatch(result.stdout, /did not cover the same URL list/);
+  assert.match(result.stdout, /candidate stopped at 360\/1106/);
+});
+
 test.after(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
