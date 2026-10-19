@@ -1,12 +1,16 @@
 // Optional local overrides (untracked). Copy config.example.js to config.local.js.
 try { importScripts('config.local.js'); } catch (e) { /* no local config: Ford bypass stays disabled */ }
-importScripts('lib/quota.js', 'lib/results.js'); // pure helpers, also covered by node tests
+importScripts('lib/quota.js', 'lib/results.js', 'lib/status.js'); // pure helpers, also covered by node tests
 
 // Tiempo extra tras "complete" para dejar que scripts async (analytics) definan digitalData
 const POST_LOAD_WAIT_MS = 1500;
 // Tiempo máximo de reintento buscando window.digitalData dentro de la página
 const DIGITALDATA_MAX_WAIT_MS = 8000;
 const DIGITALDATA_POLL_INTERVAL_MS = 500;
+// Cuántos polls seguidos con el MISMO contenido debe mantener digitalData para
+// aceptarlo. Las páginas suelen definir un digitalData inicial y enriquecerlo
+// enseguida; quedarse con el primer valor truthy devolvía dato viejo como "ok".
+const DIGITALDATA_STABLE_POLLS = 2;
 // Si quieres que las pestañas NO se cierren automáticamente al terminar, pon esto en false
 const CLOSE_TABS_AFTER_READ = true;
 // Cuántas URLs se procesan en paralelo. Con listas largas (decenas/cientos),
@@ -341,32 +345,52 @@ async function processUrl(url, idx, job) {
     await ensureFordCookie(url);
     tab = await chrome.tabs.create({ url, active: false });
     trackTab(job, tab.id);
-    await waitForTabComplete(tab.id, TAB_LOAD_TIMEOUT_MS);
+    const loadOutcome = await waitForTabComplete(tab.id, TAB_LOAD_TIMEOUT_MS);
+
     // Capture the post-redirect URL: the data layer belongs to THIS page,
     // which may differ from the requested URL (locale/preview redirects,
-    // chrome-error pages). Best effort; stays null if the tab is gone.
+    // error pages). Best effort; stays null if the tab is gone.
+    let pageUrl = null;
     try {
       const current = await chrome.tabs.get(tab.id);
-      if (current && current.url) entry.finalUrl = current.url;
+      if (current && current.url) {
+        entry.finalUrl = current.url;
+        pageUrl = current.url;
+      }
     } catch (e) { /* tab already gone */ }
+
+    // A closed tab or a network error page carries no data layer: say so
+    // instead of reporting "sin digitalData" for a page that never loaded.
+    if (loadOutcome === 'gone' || isErrorPageUrl(pageUrl)) {
+      entry.status = 'error';
+      entry.error = loadOutcome === 'gone'
+        ? TAB_CLOSED_MESSAGE
+        : 'Page failed to load: ' + pageUrl;
+      return capEntry(entry, MAX_ENTRY_BYTES);
+    }
+
     await sleep(POST_LOAD_WAIT_MS);
 
     const injection = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN', // MAIN world shares the page real window where digitalData and Adobe objects live
       func: extractPageAnalytics,
-      args: [DIGITALDATA_MAX_WAIT_MS, DIGITALDATA_POLL_INTERVAL_MS]
+      args: [DIGITALDATA_MAX_WAIT_MS, DIGITALDATA_POLL_INTERVAL_MS, DIGITALDATA_STABLE_POLLS]
     });
 
     const payload = injection && injection[0] ? injection[0].result : null;
     if (!payload || typeof payload !== 'object') {
-      entry.status = 'no-data';
+      const result = noDataResult(loadOutcome);
+      entry.status = result.status;
+      entry.error = result.error;
     } else {
       const dd = payload.dd !== undefined ? payload.dd : null;
       const aa = payload.aa !== undefined ? payload.aa : null;
       const hasAA = !!(aa && (aa.s || aa.satellite || aa.dataLayer));
       if (!dd && !hasAA) {
-        entry.status = 'no-data';
+        const result = noDataResult(loadOutcome);
+        entry.status = result.status;
+        entry.error = result.error;
       } else {
         entry.digitalData = dd;
         entry.adobeAnalytics = hasAA ? aa : null;
@@ -390,36 +414,38 @@ async function processUrl(url, idx, job) {
 
 // ---- Wait for tab load ----
 
+// Resolves with 'complete', 'timeout' or 'gone' so the caller can report an
+// honest status instead of treating every outcome as a loaded page.
 function waitForTabComplete(tabId, timeoutMs) {
   return (async () => {
     // Check the current status before listening: if the tab already finished we
     // would otherwise wait forever for an event that will never fire again.
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab && tab.status === 'complete') return;
+      if (tab && tab.status === 'complete') return 'complete';
     } catch (e) {
-      return; // tab disappeared before we could attach
+      return 'gone'; // tab disappeared before we could attach
     }
 
-    await new Promise((resolve) => {
+    return await new Promise((resolve) => {
       let settled = false;
-      function finish() {
+      function finish(outcome) {
         if (settled) return;
         settled = true;
         chrome.tabs.onUpdated.removeListener(listener);
         clearTimeout(timer);
-        resolve();
+        resolve(outcome);
       }
       function listener(updatedTabId, changeInfo) {
-        if (updatedTabId === tabId && changeInfo && changeInfo.status === 'complete') finish();
+        if (updatedTabId === tabId && changeInfo && changeInfo.status === 'complete') finish('complete');
       }
       chrome.tabs.onUpdated.addListener(listener);
       // Re-check: the tab may have completed between the get() above and the listener.
       chrome.tabs.get(tabId).then((tab) => {
-        if (tab && tab.status === 'complete') finish();
-      }).catch(() => finish());
+        if (tab && tab.status === 'complete') finish('complete');
+      }).catch(() => finish('gone'));
       // Global per-URL safety timeout if "complete" never arrives.
-      const timer = setTimeout(finish, timeoutMs || TAB_LOAD_TIMEOUT_MS);
+      const timer = setTimeout(() => finish('timeout'), timeoutMs || TAB_LOAD_TIMEOUT_MS);
     });
   })();
 }
@@ -577,17 +603,20 @@ function removeKeys(keys) {
 
 // Esta función se inyecta y se ejecuta DENTRO de la página, no en la extensión.
 // Debe ser autocontenida (sin referencias externas).
-function extractPageAnalytics(maxWaitMs, intervalMs) {
+function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
   return new Promise((resolve) => {
-    const start = Date.now();
-    // Algunos sitios exponen la variable como "digitalData" (estándar GTM/Adobe)
-    // y otros como "digitaldata" (todo minúsculas); se revisan ambas.
-    const candidateNames = ['digitalData', 'digitaldata'];
-
     // In the MAIN world the page can tamper with globals, so capture the
     // references we depend on up front instead of trusting them at use time.
     const safeStringify = JSON.stringify;
     const safeIsArray = Array.isArray;
+    const safeKeys = Object.keys;
+    const safeNow = Date.now;
+    const requiredPolls = stablePolls > 0 ? stablePolls : 1;
+    const start = safeNow();
+
+    // Algunos sitios exponen la variable como "digitalData" (estándar GTM/Adobe)
+    // y otros como "digitaldata" (todo minúsculas); se revisan ambas.
+    const candidateNames = ['digitalData', 'digitaldata'];
     // Scalar AppMeasurement fields worth keeping; functions and huge internals are dropped.
     const sFieldPattern = /^(account|pageName|channel|server|pageType|campaign|products|events|purchaseID|transactionID|state|zip|hier\d+|eVar\d+|prop\d+|list\d+|pev\d*|pe)$/;
 
@@ -621,6 +650,18 @@ function extractPageAnalytics(maxWaitMs, intervalMs) {
       return out;
     }
 
+    // Un digitalData definido pero vacío es muy común antes de que la página lo
+    // llene: un objeto sin claves no es dato, y devolverlo cortaba la espera.
+    function isPopulated(value) {
+      if (!value || typeof value !== 'object') return false;
+      if (safeIsArray(value)) return value.length > 0;
+      return safeKeys(value).length > 0;
+    }
+
+    let lastSignature = null;
+    let stableCount = 0;
+    let best = null;
+
     function check() {
       const foundName = candidateNames.find((name) => typeof window[name] !== 'undefined');
       let dd = null;
@@ -629,20 +670,30 @@ function extractPageAnalytics(maxWaitMs, intervalMs) {
           const raw = window[foundName];
           if (raw !== null && typeof raw === 'object') {
             const clone = sanitize(raw, 0, []);
-            if (clone !== null && typeof clone === 'object') {
-              // Validate that the captured serializer can represent the clone.
-              safeStringify(clone);
+            if (clone !== null && typeof clone === 'object' && isPopulated(clone)) {
+              // Valida que el serializador capturado pueda representar el clon y
+              // sirve de firma para exigir que el payload se mantenga estable.
+              const signature = safeStringify(clone);
               dd = clone;
+              best = clone;
+              if (signature === lastSignature) {
+                stableCount++;
+              } else {
+                lastSignature = signature;
+                stableCount = 1;
+              }
             }
           }
         } catch (e) {
           dd = null; // never leak an __error object into the results contract
         }
       }
-      if (dd) {
+      if (dd && stableCount >= requiredPolls) {
         resolve({ dd: dd, aa: collectAdobe() });
-      } else if (Date.now() - start > maxWaitMs) {
-        resolve({ dd: null, aa: collectAdobe() });
+      } else if (safeNow() - start > maxWaitMs) {
+        // Nunca se estabilizó: devolvemos lo último visto (o null) en vez de
+        // inventar un OK con el primer valor parcial.
+        resolve({ dd: best, aa: collectAdobe() });
       } else {
         setTimeout(check, intervalMs);
       }
