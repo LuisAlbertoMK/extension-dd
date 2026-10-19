@@ -43,12 +43,12 @@ function compareSummaries(base, candidate) {
   }
   if (stopped.length) {
     add('blocker', `Incomplete run (${stopped.join('; ')}): a partial list cannot be compared. Rerun the incomplete side over the whole list.`);
-    return { verdict: 'invalid', findings, deltas: null };
+    return { verdict: 'invalid', reason: 'incomplete-run', findings, deltas: null };
   }
 
   if (base.total !== candidate.total) {
     add('blocker', `Different URL lists: base ${base.total} vs candidate ${candidate.total}. Rerun both with the same input.`);
-    return { verdict: 'invalid', findings, deltas: null };
+    return { verdict: 'invalid', reason: 'different-lists', findings, deltas: null };
   }
 
   if (statusSum(base) !== base.total) {
@@ -149,7 +149,12 @@ function printReport(base, candidate, comparison) {
   console.log('');
 
   if (comparison.verdict === 'invalid') {
-    console.log('VERDICT: INVALID INPUT - the two runs did not cover the same URL list.');
+    // The verdict line has to name the real reason: a short run and a different
+    // list send you to different places.
+    const why = comparison.reason === 'incomplete-run'
+      ? 'a run did not finish the list (see the blocker above)'
+      : 'the two runs did not cover the same URL list';
+    console.log(`VERDICT: INVALID INPUT - ${why}.`);
   } else if (comparison.verdict === 'reject') {
     console.log('VERDICT: DO NOT ADOPT - a blocker above must be resolved first.');
   } else if (comparison.verdict === 'adjust') {

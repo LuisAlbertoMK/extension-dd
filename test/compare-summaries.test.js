@@ -62,6 +62,7 @@ test('different URL lists make the comparison invalid', () => {
   const result = compareSummaries(summary({ ok: 10, total: 368 }), summary({ ok: 10, total: 1106 }));
   assert.strictEqual(result.verdict, 'invalid');
   assert.strictEqual(result.deltas, null);
+  assert.strictEqual(result.reason, 'different-lists');
   assert.ok(result.findings.some((f) => f.level === 'blocker' && f.message.includes('Different URL lists')));
 });
 
@@ -70,6 +71,7 @@ test('a run that stopped early is invalid, naming how far it got', () => {
   const cand = { ...summary({ ok: 110, noData: 220, error: 30 }), expectedTotal: 368 };
   const result = compareSummaries(base, cand);
   assert.strictEqual(result.verdict, 'invalid');
+  assert.strictEqual(result.reason, 'incomplete-run');
   const blocker = result.findings.find((f) => f.level === 'blocker' && f.message.includes('Incomplete run'));
   assert.ok(blocker, 'expected an incomplete-run blocker');
   assert.match(blocker.message, /candidate stopped at 360\/368/);
