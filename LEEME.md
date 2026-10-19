@@ -48,12 +48,25 @@
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
 - Requiere permisos amplios (`<all_urls>`) porque debe poder inyectar código en cualquier sitio que pegues.
 
+## Persistencia (una clave por URL)
+Cada URL terminada se guarda en su propia clave `ddR:<índice>` y el progreso en
+`ddProgress`. Antes se reescribía la corrida completa en cada URL (coste
+cuadrático) y un fallo de cuota se ignoraba, perdiendo la corrida entera en
+memoria. Ahora:
+- La escritura por URL es de tamaño constante y el worker no acumula payloads.
+- Con `unlimitedStorage` la cuota de 10 MB deja de ser un techo realista.
+- Si una escritura falla igual (disco lleno), la corrida se detiene, se conservan
+  los resultados ya guardados y el popup/resumen muestran el motivo
+  (`storage-quota` / `storage-write`).
+
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 25 tests (urls, formato, resultados, quota, contrato de export).
+- `npm test` — 49 tests (urls, formato, resultados, quota, contrato de export y
+  un arnés de integración de `background.js` con la API de Chrome simulada:
+  layout por URL, reanudación y aborto por cuota).
 - `node --test --experimental-test-coverage test/` — medición (~99% líneas en `lib/`).
 El `test/contract.test.js` valida el schema que consumen importadores externos
-(p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de
+( p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de
 romper la auditoría en silencio.
 
 ## Configuración local (Ford AEM, opcional)1. Copia `config.example.js` a `config.local.js` (ese archivo está en `.gitignore` y nunca se sube).

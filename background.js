@@ -1,6 +1,6 @@
 // Optional local overrides (untracked). Copy config.example.js to config.local.js.
 try { importScripts('config.local.js'); } catch (e) { /* no local config: Ford bypass stays disabled */ }
-importScripts('lib/quota.js'); // capEntry (pure, also covered by node tests)
+importScripts('lib/quota.js', 'lib/results.js'); // pure helpers, also covered by node tests
 
 // Tiempo extra tras "complete" para dejar que scripts async (analytics) definan digitalData
 const POST_LOAD_WAIT_MS = 1500;
@@ -32,13 +32,14 @@ const FORD_COOKIE_VALUE = (globalThis.FORD_CONFIG && globalThis.FORD_CONFIG.cook
 const FORD_DNR_RULE_ID = 1;
 
 const JOB_KEY = 'ddJob';
-const RESULTS_KEY = 'ddResults';
 const RUNNING_KEY = 'ddJobRunning';
-// Minimum gap between results snapshots flushed while a job runs. Parallel
-// workers accumulate into memory; throttling avoids re-serializing the whole
-// result set on every single URL, while finalizeJob() still guarantees a final
-// write so no completed result is lost.
-const RESULTS_FLUSH_INTERVAL_MS = 1000;
+// Legacy single-key snapshot from older builds (read-only fallback).
+const LEGACY_RESULTS_KEY = 'ddResults';
+// Small, frequently written state (progress, next index, live tab ids). Kept
+// apart from ddJob so finishing one URL never rewrites the whole URL list.
+const PROGRESS_KEY = 'ddProgress';
+// Failure marker shown by the popup/results page after an aborted run.
+const JOB_ERROR_KEY = 'ddJobError';
 
 // In-memory job for the current service worker lifetime. MV3 workers can be
 // suspended at any time, so the durable state lives in chrome.storage.local and
@@ -168,17 +169,26 @@ async function startJob(urls) {
     tabIds: []
   };
   // Claim the slot synchronously so a second START_JOB cannot slip in.
-  activeJob = newJob(record, {});
+  activeJob = newJob(record, new Set());
 
   await ensureFordRequestRules().catch(() => {});
   await closeOrphanTabs(); // remove tabs left behind by a previous suspended run
-  await storageSet({
-    [RUNNING_KEY]: true,
-    ddTotal: urls.length,
-    [RESULTS_KEY]: {},
-    ddStartedAt: record.startedAt,
-    [JOB_KEY]: snapshot(record)
-  });
+  try {
+    // Drop per-URL results plus the legacy snapshot so a new run cannot mix
+    // with the previous one (and frees quota before the first write).
+    await clearStoredResults();
+    await storageSet({
+      [RUNNING_KEY]: true,
+      ddTotal: urls.length,
+      ddStartedAt: record.startedAt,
+      ddFinishedAt: null,
+      [PROGRESS_KEY]: progressPayload(activeJob),
+      [JOB_KEY]: snapshot(record)
+    });
+  } catch (e) {
+    if (activeJob && activeJob.record === record) activeJob = null;
+    throw e;
+  }
 
   launchJob(activeJob);
   return { ok: true };
@@ -192,14 +202,23 @@ async function cancelJob() {
   return { ok: true };
 }
 
-function newJob(record, results) {
+// `done` is the set of indices already persisted. Payloads live in storage, so
+// the worker never accumulates every response in memory.
+function newJob(record, done) {
   return {
     record,
-    results,
-    handle: { cancelled: false },
-    write: makeWriter(),
-    resultsFlushTimer: null,
-    lastResultsFlushAt: 0
+    done: done || new Set(),
+    handle: { cancelled: false, failed: null },
+    write: makeWriter()
+  };
+}
+
+function progressPayload(job) {
+  return {
+    done: job.done.size,
+    total: job.record.urls.length,
+    nextIndex: job.record.nextIndex,
+    tabIds: Array.isArray(job.record.tabIds) ? job.record.tabIds.slice() : []
   };
 }
 
@@ -212,23 +231,27 @@ function launchJob(job) {
 
 async function finalizeJob(job, openResults) {
   if (activeJob === job) activeJob = null;
-  const cancelled = job.handle.cancelled;
+  const failed = job.handle.failed;
+  const userCancelled = job.handle.cancelled && !failed;
   await ensurePerfRules(false).catch(() => {});
 
-  // Drop any pending throttled flush and persist the final accumulated snapshot
-  // so a late suspend cannot lose the last batch of results.
-  if (job.resultsFlushTimer) {
-    clearTimeout(job.resultsFlushTimer);
-    job.resultsFlushTimer = null;
-  }
-  await commitResults(job);
-
-  storageSet({ [RUNNING_KEY]: false, ddFinishedAt: Date.now() }).catch(() => {});
-  job.record.status = 'idle';
+  // Persist the final progress/status before opening results so a suspend right
+  // after the last URL cannot leave a zombie "running" job behind.
+  await persistProgress(job);
+  job.record.status = failed ? 'aborted' : 'idle';
   job.record.tabIds = [];
-  job.write({ [JOB_KEY]: snapshot(job.record) }).catch(() => {});
+  try {
+    await storageSet({
+      [RUNNING_KEY]: false,
+      ddFinishedAt: Date.now(),
+      [JOB_KEY]: snapshot(job.record)
+    });
+  } catch (e) {
+    console.warn('DigitalData: failed to persist final job state', e);
+  }
 
-  if (openResults && !cancelled) {
+  // On a storage failure we still open results so the partial run is readable.
+  if (openResults && !userCancelled) {
     chrome.tabs.create({ url: chrome.runtime.getURL('results.html') });
   }
 }
@@ -237,6 +260,8 @@ async function finalizeJob(job, openResults) {
 // on every wakeup: it is a no-op unless a persisted job is still "running".
 async function maybeResume() {
   if (activeJob) return;
+  // Read the small job record first: waking the worker must not pull a whole
+  // result set into memory when there is nothing to resume.
   const stored = await storageGet(JOB_KEY);
   const record = stored[JOB_KEY];
   if (!record || record.status !== 'running') return;
@@ -245,24 +270,34 @@ async function maybeResume() {
 
   await closeOrphanTabs();
 
-  const res = await storageGet(RESULTS_KEY);
-  const results = res[RESULTS_KEY] || {};
+  // One full read only when a job is actually in flight.
+  const all = await storageGet(null);
+  const results = collectResults(all);
+  const done = new Set(
+    Object.keys(results)
+      .map((key) => parseInt(key, 10))
+      .filter((idx) => Number.isInteger(idx) && idx >= 0)
+  );
 
   record.tabIds = [];
-  record.nextIndex = firstIncompleteIndex(record.urls, results);
+  record.nextIndex = firstIncompleteIndex(record.urls, done);
 
-  const job = newJob(record, results);
+  const job = newJob(record, done);
   activeJob = job;
-  await storageSet({ [RUNNING_KEY]: true, ddTotal: record.urls.length }).catch(() => {});
+  await storageSet({
+    [RUNNING_KEY]: true,
+    ddTotal: record.urls.length,
+    [PROGRESS_KEY]: progressPayload(job)
+  }).catch(() => {});
   launchJob(job);
 }
 
 // Smallest index whose result is not stored yet; used to resume without
 // re-processing already-completed URLs.
-function firstIncompleteIndex(urls, results) {
+function firstIncompleteIndex(urls, done) {
   let i = 0;
   while (i < urls.length) {
-    if (!Object.prototype.hasOwnProperty.call(results, `${i}__${urls[i]}`)) return i;
+    if (!done.has(i)) return i;
     i++;
   }
   return urls.length;
@@ -278,9 +313,7 @@ async function runQueue(job) {
   function claim() {
     while (record.nextIndex < urls.length) {
       const idx = record.nextIndex++;
-      if (!Object.prototype.hasOwnProperty.call(job.results, `${idx}__${urls[idx]}`)) {
-        return idx;
-      }
+      if (!job.done.has(idx)) return idx;
     }
     return -1;
   }
@@ -291,12 +324,8 @@ async function runQueue(job) {
       const idx = claim();
       if (idx < 0) return;
 
-      await persistProgress(job);
-      const key = `${idx}__${urls[idx]}`;
       const entry = await processUrl(urls[idx], idx, job);
-      job.results[key] = entry;
-      await commitResults(job);
-      persistProgress(job);
+      if (!(await persistEntry(job, idx, entry))) return;
     }
   }
 
@@ -342,10 +371,6 @@ async function processUrl(url, idx, job) {
         entry.digitalData = dd;
         entry.adobeAnalytics = hasAA ? aa : null;
         entry.status = 'ok';
-        const capped = capEntry(entry, MAX_ENTRY_BYTES);
-        entry.digitalData = capped.digitalData;
-        entry.adobeAnalytics = capped.adobeAnalytics;
-        entry.truncated = capped.truncated;
       }
     }
   } catch (e) {
@@ -446,29 +471,70 @@ function snapshot(record) {
   };
 }
 
+// Persist only the tiny progress object. The URL list lives in ddJob and is
+// written at start/finalize, so finishing one URL is O(1), not O(n).
 async function persistProgress(job) {
   try {
-    await job.write({ [JOB_KEY]: snapshot(job.record) });
+    await job.write({ [PROGRESS_KEY]: progressPayload(job) });
+    return true;
   } catch (e) {
-    console.warn('DigitalData: failed to persist job progress', e);
+    await handleStorageFailure(job, e);
+    return false;
   }
 }
 
-async function commitResults(job) {
-  // Full-snapshot write from the in-memory accumulator: no concurrent
-  // read-modify-write of chrome.storage, so parallel workers cannot clobber
-  // each other's results.
-  const data = {};
-  Object.keys(job.results).forEach((k) => { data[k] = job.results[k]; });
+// Persist one finished URL and its progress in the same queued write. One key
+// per URL keeps storage cost linear and never re-serializes the whole run.
+async function persistEntry(job, idx, entry) {
+  // Mark first so concurrent workers never write a stale `done` count; a failed
+  // write aborts the whole job anyway.
+  job.done.add(idx);
   try {
-    await job.write({ [RESULTS_KEY]: data });
+    await job.write({
+      [resultKey(idx)]: entry,
+      [PROGRESS_KEY]: progressPayload(job)
+    });
+    return true;
   } catch (e) {
-    console.warn('DigitalData: failed to persist results', e);
+    job.done.delete(idx);
+    await handleStorageFailure(job, e);
+    return false;
   }
 }
 
-// Serialize storage writes so whole-snapshot writes never land out of order and
-// overwrite a newer one.
+// A quota/full-disk failure used to be swallowed, so every later write failed
+// too and the whole run was lost silently. Stop the queue, free the legacy
+// snapshot and leave a small marker the UI can show.
+async function handleStorageFailure(job, error) {
+  if (job.handle.failed) return;
+  const message = error && error.message ? error.message : String(error);
+  job.handle.failed = /quota/i.test(message) ? 'storage-quota' : 'storage-write';
+  job.handle.cancelled = true;
+  console.warn('DigitalData: storage write failed, aborting job:', message);
+  try { await removeKeys([LEGACY_RESULTS_KEY]); } catch (e) { /* ignore */ }
+  try {
+    await storageSet({
+      [RUNNING_KEY]: false,
+      [JOB_ERROR_KEY]: job.handle.failed,
+      ddFinishedAt: Date.now()
+    });
+  } catch (e) {
+    // Storage is still full: the in-memory flag already stops the queue and
+    // the finalize path retries the marker.
+  }
+}
+
+// Removes every per-URL result plus the legacy snapshot from older builds.
+async function clearStoredResults() {
+  const all = await storageGet(null);
+  const keys = Object.keys(all || {}).filter((key) =>
+    isResultKey(key) || key === LEGACY_RESULTS_KEY || key === JOB_ERROR_KEY
+  );
+  if (keys.length) await removeKeys(keys);
+}
+
+// Serialize storage writes so a slower write can never land after a newer one
+// and overwrite it (progress counts in particular).
 function makeWriter() {
   let chain = Promise.resolve();
   return function write(items) {
@@ -490,6 +556,16 @@ function storageGet(keys) {
 function storageSet(items) {
   return new Promise((resolve, reject) => {
     chrome.storage.local.set(items, () => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve();
+    });
+  });
+}
+
+function removeKeys(keys) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.remove(keys, () => {
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve();
