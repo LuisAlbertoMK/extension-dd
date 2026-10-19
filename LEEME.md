@@ -38,14 +38,24 @@
 
 ## Rendimiento (rama perf/*)
 - Durante cada corrida se bloquean imágenes, video y fuentes vía `declarativeNetRequest` (`BLOCK_HEAVY_RESOURCES`): recorta segundos por página sin afectar data layers (scripts, XHR y documentos nunca se bloquean). Al terminar (o cancelar) la regla se retira sola, incluso si el worker muere a mitad.
-- Calibración con datos reales (368 URLs en 12m05s ≈ 9.9s/URL): si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s); si la máquina aguantó bien, sube `CONCURRENCY` (5→8). Riesgo: perder data layers tardíos.
+- Calibración con datos reales (368 URLs en 12m05s ≈ 9.9 s de carga por página en serie, ≈2 s por URL de reloj de pared con `CONCURRENCY=5`): si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s); si la máquina aguantó bien, sube `CONCURRENCY` (5→8). Riesgo: perder data layers tardíos.
 - Diferido a propósito: caché entre corridas (en auditoría, saltear URLs es dato rancio — solo tendría sentido como modo opt-in "qué cambió") y pool de tabs (invasivo en el `runQueue` actual para la ganancia que da).
+- Un reintento transitorio cuesta hasta `RETRY_BASE_DELAY_MS` (400 ms) con jitter, y solo se paga cuando falla la infraestructura (no en páginas lentas ni en errores de red, que no se reintentan).
 
 ## Verdad del dato (rama perf/*)
 - Cada entry guarda `finalUrl` (URL post-redirect, o `chrome-error://` si la página nunca cargó): el data layer pertenece a ESA página. Si difiere de la pedida, la tarjeta lo muestra en amarillo.
 - Un `digitalData` definido pero **vacío** ya no cuenta como dato: se espera a que tenga contenido y se mantenga igual durante `DIGITALDATA_STABLE_POLLS` polls (por defecto 2). Antes el primer objeto truthy —aunque fuera `{}`— cortaba la espera y se reportaba como OK.
 - Un timeout de carga (25s) o una página de error de red (`chrome-error://`) se reportan como **error**, no como "sin digitalData": antes la auditoría culpaba al sitio por una página que la extensión nunca llegó a leer.
 - Paridad entre ramas: corre el mismo set en ambas, descarga el DD de cada una y compara con `npm run parity -- base-dd.json perf-dd.json` (exit 0 = paridad, 1 = divergencia). Adoptar perf solo con paridad total.
+
+## Validación A/B (antes de adoptar perf)
+Adoptar la rama `perf/*` sin medirla es fe. El procedimiento:
+1. Congela la lista de URLs (el `.txt` que pegás en el popup) y usa **la misma** en las dos corridas.
+2. Corre el set en la base (`checkpoint/pre-fase1`), recarga la extensión en `chrome://extensions`, corre el mismo set en la rama perf: mismo día, misma máquina, misma red.
+3. Descarga el resumen de cada corrida y compáralos con
+   `npm run compare -- base-resumen.json perf-resumen.json` (exit 0 = adoptar, 1 = ajustar/rechazar, 2 = input inválido).
+   El comando verifica que la lista coincida, que `ok` no baje, que los errores nuevos expliquen los "sin digitalData" que faltan, y que el tiempo por URL no suba más de 15% (25% bloquea).
+4. `npm run parity -- base-dd.json perf-dd.json` para el contenido del data layer, no solo los conteos.
 
 ## Notas
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
@@ -62,12 +72,39 @@ memoria. Ahora:
   los resultados ya guardados y el popup/resumen muestran el motivo
   (`storage-quota` / `storage-write`).
 
+## Resiliencia (watchdog, cancelación, reintentos)
+- **Watchdog** (`chrome.alarms`, cada minuto, solo mientras hay corrida): Chrome
+  puede matar el service worker a mitad de una corrida y nada lo despertaba
+  hasta abrir el popup. Ahora la alarma despierta al worker, reanuda la corrida y
+  además reinicia una cola que lleva `WATCHDOG_STALL_MS` (2 min) sin guardar
+  resultados: se descartan las pestañas colgadas y se reanuda desde el primer
+  índice sin resultado, sin reprocesar lo ya hecho.
+- **Cancelar** (botón en el popup): funciona incluso si el worker fue suspendido
+  y ya no tiene el job en memoria (el estado persistido manda). Una corrida
+  cancelada no vuelve a escribir progreso —sus contadores serían viejos— y deja
+  `ddJobError: 'cancelled'` para que popup y resultados lo digan explícito.
+- **Reintentos**: un fallo transitorio de infraestructura (pestaña rechazada,
+  pestaña descartada por memoria) se reintenta una vez con jitter. Una página de
+  error de red o un timeout **no** se reintentan: son la respuesta del sitio, no
+  un hipo de la extensión, y reintentarlos duplicaría el tiempo para el mismo
+  veredicto. El reintento no agrega campos al contrato del entry, así que los
+  mensajes de error siguen siendo comparables entre corridas.
+- Las pestañas huérfanas de un worker muerto sí se cierran: los ids vivos se
+  guardan en `ddProgress.tabIds` y `closeOrphanTabs()` lee también esa clave
+  (antes leía solo `ddJob`, que no se actualiza a mitad de corrida, así que las
+  pestañas quedaban abiertas para siempre).
+
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 60 tests (urls, formato, resultados, quota, estado de carga,
-  contrato de export y un arnés de integración de `background.js` con la API de
-  Chrome simulada: layout por URL, reanudación, aborto por cuota, página de error
+- `npm test` — 87 tests (urls, formato, resultados, quota, estado de carga,
+  contrato de export, reglas y CLI del comparador de resúmenes, y un arnés de
+  integración de `background.js` con la API de Chrome simulada: layout por URL,
+  reanudación, aborto por cuota, página de error, cancelación con y sin worker
+  vivo, watchdog al despertar y al reiniciar una cola muda, reintento transitorio
   y extractor de `digitalData`).
+- `node --test --experimental-test-coverage test/` — cobertura de `lib/` entre
+  89% y 100% por archivo (`lib/schema.js` es el más bajo: ramas de violación), y
+  `tools/compare-summaries.js` en ~99% (reglas y CLI probadas).
 - `node --test --experimental-test-coverage test/` — medición (~99% líneas en `lib/`).
 El `test/contract.test.js` valida el schema que consumen importadores externos
 ( p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de

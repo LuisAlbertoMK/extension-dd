@@ -98,7 +98,9 @@ function renderSummary() {
   const meta = lastMeta;
   const done = lastEntries.length;
   const elapsed = formatElapsed(meta.startedAt, meta.running ? Date.now() : meta.finishedAt);
-  if (meta.jobError) {
+  if (meta.jobError === 'cancelled') {
+    summaryEl.textContent = `Corrida cancelada · ${done}/${meta.total || done} procesadas · ${elapsed}`;
+  } else if (meta.jobError) {
     summaryEl.textContent = `Corrida detenida por ${describeJobError(meta.jobError)} · ${done}/${meta.total || done} procesadas · ${elapsed}`;
   } else if (meta.running) {
     summaryEl.textContent = `Procesando... ${done}/${meta.total || 0} · ${elapsed}`;

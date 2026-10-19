@@ -21,6 +21,26 @@ const TAB_LOAD_TIMEOUT_MS = 25000;
 // Per-entry cap so a single huge digitalData payload cannot blow the storage quota.
 const MAX_ENTRY_BYTES = 256 * 1024;
 
+// --- Watchdog ---
+// MV3 may kill the service worker mid-run. Without a periodic wake-up nothing
+// brings the queue back until the popup is opened, so the run stays frozen with
+// ddJobRunning=true. The alarm wakes the worker, resumes the job and restarts a
+// queue that stopped producing results.
+const WATCHDOG_ALARM = 'ddWatchdog';
+const WATCHDOG_PERIOD_MINUTES = 1;
+// No persisted result for this long means the in-memory queue is stuck (hung
+// tabs, a killed injection). A single URL costs at most TAB_LOAD_TIMEOUT_MS +
+// DIGITALDATA_MAX_WAIT_MS (~33s), so 2 minutes is comfortably above normal.
+const WATCHDOG_STALL_MS = 120000;
+
+// --- Retry ---
+// One retry for transient infrastructure failures (throttled tab creation, a
+// discarded tab), with full jitter so parallel workers do not retry in lockstep.
+// Deterministic answers (network error pages, load timeouts) are never retried:
+// it would double the wall time for exactly the same verdict.
+const RETRY_MAX_ATTEMPTS = 2;
+const RETRY_BASE_DELAY_MS = 400;
+
 // --- Throughput tuning (calibrate with real runs, e.g. 368 URLs in 12m05s) ---
 // Blocking images/media/fonts while a job runs cuts load time without
 // affecting data layers (scripts, XHR and documents are never blocked).
@@ -49,6 +69,10 @@ const JOB_ERROR_KEY = 'ddJobError';
 // suspended at any time, so the durable state lives in chrome.storage.local and
 // is rebuilt by maybeResume() when the worker wakes up again.
 let activeJob = null;
+// Reentrancy latch: the top-level maybeResume(), onStartup and the watchdog
+// alarm can all fire at once and would otherwise launch two queues over the
+// same record (double tabs, fighting progress writes).
+let resumeInFlight = false;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return;
@@ -67,6 +91,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+// The watchdog alarm is the only thing that can wake a suspended worker while a
+// job is in flight, so it is registered unconditionally (guarded for the test
+// harness and for browsers without the alarms API).
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === WATCHDOG_ALARM) watchdogTick().catch(() => {});
+  });
+}
 
 chrome.runtime.onStartup.addListener(() => {
   maybeResume();
@@ -157,13 +190,22 @@ async function ensurePerfRules(enable) {
 }
 
 async function startJob(urls) {
-  if (activeJob) return { ok: false, reason: 'already-running' };
+  // A cancelled job is not a running job: it is only draining its in-flight
+  // URLs, so a new run is allowed to take over.
+  if (activeJob && !activeJob.handle.cancelled) return { ok: false, reason: 'already-running' };
   if (!Array.isArray(urls) || !urls.length) return { ok: false, reason: 'no-urls' };
 
   const stored = await storageGet(RUNNING_KEY);
   // Re-check after the await: a concurrent START_JOB may have claimed the slot.
-  if (activeJob) return { ok: false, reason: 'already-running' };
+  if (activeJob && !activeJob.handle.cancelled) return { ok: false, reason: 'already-running' };
   if (stored[RUNNING_KEY]) return { ok: false, reason: 'already-running' };
+
+  // Supersede the draining job only once this run is cleared to start, so its
+  // finalize cannot overwrite the state we are about to write.
+  if (activeJob) {
+    activeJob.handle.superseded = true;
+    activeJob = null;
+  }
 
   const record = {
     status: 'running',
@@ -198,11 +240,49 @@ async function startJob(urls) {
   return { ok: true };
 }
 
+// Cancelling must work even when the worker was suspended and the in-memory job
+// is gone: the persisted record is the source of truth then. The terminal state
+// is written here and not only in finalizeJob, so the popup flips immediately
+// and a worker killed while draining cannot leave a zombie "running" job.
 async function cancelJob() {
-  if (!activeJob) return { ok: false, reason: 'no-job' };
-  activeJob.handle.cancelled = true;
+  const job = activeJob;
+  if (job) job.handle.cancelled = true;
+
   await closeOrphanTabs();
-  if (activeJob) activeJob.record.tabIds = [];
+  if (job) job.record.tabIds = [];
+
+  let record = job ? job.record : null;
+  let existingError = job ? job.handle.failed : null;
+  if (!record) {
+    try {
+      const stored = await storageGet([JOB_KEY, JOB_ERROR_KEY]);
+      record = stored[JOB_KEY] || null;
+      existingError = stored[JOB_ERROR_KEY] || null;
+    } catch (e) {
+      record = null;
+    }
+  }
+  // Nothing to cancel, or the run already ended. A storage failure is not a
+  // cancellation: it keeps its own marker.
+  if (!record || record.status !== 'running' || existingError) {
+    return job ? { ok: true } : { ok: false, reason: 'no-job' };
+  }
+
+  record.status = 'cancelled';
+  record.tabIds = [];
+  try {
+    await storageSet({
+      [RUNNING_KEY]: false,
+      ddFinishedAt: Date.now(),
+      [JOB_ERROR_KEY]: 'cancelled',
+      [JOB_KEY]: snapshot(record)
+    });
+  } catch (e) {
+    console.warn('DigitalData: failed to persist the cancelled job state', e);
+  }
+  // Disarm after the terminal state is stored, so a worker killed in between is
+  // still woken up (and then finds a job that is no longer running).
+  await ensureWatchdog(false);
   return { ok: true };
 }
 
@@ -212,21 +292,31 @@ function newJob(record, done) {
   return {
     record,
     done: done || new Set(),
-    handle: { cancelled: false, failed: null },
+    handle: { cancelled: false, failed: null, superseded: false },
+    // In-memory heartbeat for the watchdog; `at` in the progress payload is its
+    // persisted twin, so a worker that dies mid-run can still be judged stalled.
+    lastProgressAt: Date.now(),
     write: makeWriter()
   };
 }
 
+// Building a payload is the heartbeat: every write carries the moment it was
+// assembled, which is what watchdogTick() uses to tell "busy" from "stuck".
 function progressPayload(job) {
+  job.lastProgressAt = Date.now();
   return {
     done: job.done.size,
     total: job.record.urls.length,
     nextIndex: job.record.nextIndex,
-    tabIds: Array.isArray(job.record.tabIds) ? job.record.tabIds.slice() : []
+    tabIds: Array.isArray(job.record.tabIds) ? job.record.tabIds.slice() : [],
+    at: job.lastProgressAt
   };
 }
 
 function launchJob(job) {
+  // Arm the watchdog before the queue's first await: if the worker is killed
+  // moments later, the alarm is what wakes it up again.
+  ensureWatchdog(true).catch(() => {});
   runQueue(job).then(
     () => finalizeJob(job, true),
     () => finalizeJob(job, false)
@@ -235,6 +325,11 @@ function launchJob(job) {
 
 async function finalizeJob(job, openResults) {
   if (activeJob === job) activeJob = null;
+  // A superseded job (watchdog restart, or a new run taking over a cancelled
+  // one) must not touch state a newer queue now owns: no perf/watchdog toggle,
+  // no RUNNING_KEY, no results tab.
+  if (job.handle.superseded) return;
+
   const failed = job.handle.failed;
   const userCancelled = job.handle.cancelled && !failed;
   await ensurePerfRules(false).catch(() => {});
@@ -242,17 +337,24 @@ async function finalizeJob(job, openResults) {
   // Persist the final progress/status before opening results so a suspend right
   // after the last URL cannot leave a zombie "running" job behind.
   await persistProgress(job);
-  job.record.status = failed ? 'aborted' : 'idle';
+  job.record.status = failed ? 'aborted' : userCancelled ? 'cancelled' : 'idle';
   job.record.tabIds = [];
   try {
-    await storageSet({
+    const finalState = {
       [RUNNING_KEY]: false,
       ddFinishedAt: Date.now(),
       [JOB_KEY]: snapshot(job.record)
-    });
+    };
+    // Leave a marker so the popup reports a deliberate cancel instead of a run
+    // that simply stopped early.
+    if (userCancelled) finalState[JOB_ERROR_KEY] = 'cancelled';
+    await storageSet(finalState);
   } catch (e) {
     console.warn('DigitalData: failed to persist final job state', e);
   }
+  // Disarm only once the terminal state is stored: if the worker is killed
+  // before that write lands, the alarm still wakes it to finish the job.
+  await ensureWatchdog(false);
 
   // On a storage failure we still open results so the partial run is readable.
   if (openResults && !userCancelled) {
@@ -263,37 +365,44 @@ async function finalizeJob(job, openResults) {
 // Rebuild an in-flight job after the service worker was suspended. Safe to call
 // on every wakeup: it is a no-op unless a persisted job is still "running".
 async function maybeResume() {
-  if (activeJob) return;
-  // Read the small job record first: waking the worker must not pull a whole
-  // result set into memory when there is nothing to resume.
-  const stored = await storageGet(JOB_KEY);
-  const record = stored[JOB_KEY];
-  if (!record || record.status !== 'running') return;
-  if (activeJob) return; // a START_JOB may have claimed the slot while we awaited
-  if (!Array.isArray(record.urls) || !record.urls.length) return;
+  // resumeInFlight also blocks the top-level call, onStartup and the watchdog
+  // from launching two queues over the same record.
+  if (activeJob || resumeInFlight) return;
+  resumeInFlight = true;
+  try {
+    // Read the small job record first: waking the worker must not pull a whole
+    // result set into memory when there is nothing to resume.
+    const stored = await storageGet(JOB_KEY);
+    const record = stored[JOB_KEY];
+    if (!record || record.status !== 'running') return;
+    if (activeJob) return; // a START_JOB may have claimed the slot while we awaited
+    if (!Array.isArray(record.urls) || !record.urls.length) return;
 
-  await closeOrphanTabs();
+    await closeOrphanTabs();
 
-  // One full read only when a job is actually in flight.
-  const all = await storageGet(null);
-  const results = collectResults(all);
-  const done = new Set(
-    Object.keys(results)
-      .map((key) => parseInt(key, 10))
-      .filter((idx) => Number.isInteger(idx) && idx >= 0)
-  );
+    // One full read only when a job is actually in flight.
+    const all = await storageGet(null);
+    const results = collectResults(all);
+    const done = new Set(
+      Object.keys(results)
+        .map((key) => parseInt(key, 10))
+        .filter((idx) => Number.isInteger(idx) && idx >= 0)
+    );
 
-  record.tabIds = [];
-  record.nextIndex = firstIncompleteIndex(record.urls, done);
+    record.tabIds = [];
+    record.nextIndex = firstIncompleteIndex(record.urls, done);
 
-  const job = newJob(record, done);
-  activeJob = job;
-  await storageSet({
-    [RUNNING_KEY]: true,
-    ddTotal: record.urls.length,
-    [PROGRESS_KEY]: progressPayload(job)
-  }).catch(() => {});
-  launchJob(job);
+    const job = newJob(record, done);
+    activeJob = job;
+    await storageSet({
+      [RUNNING_KEY]: true,
+      ddTotal: record.urls.length,
+      [PROGRESS_KEY]: progressPayload(job)
+    }).catch(() => {});
+    launchJob(job);
+  } finally {
+    resumeInFlight = false;
+  }
 }
 
 // Smallest index whose result is not stored yet; used to resume without
@@ -305,6 +414,61 @@ function firstIncompleteIndex(urls, done) {
     i++;
   }
   return urls.length;
+}
+
+// ---- Watchdog ----
+
+// The alarm exists only while a queue runs: an idle extension never wakes up.
+// It is re-created on every start/resume, so it does not rely on alarms
+// surviving a browser restart.
+async function ensureWatchdog(enable) {
+  if (!chrome.alarms || !chrome.alarms.create || !chrome.alarms.clear) return;
+  try {
+    if (enable) {
+      await chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: WATCHDOG_PERIOD_MINUTES });
+    } else {
+      await chrome.alarms.clear(WATCHDOG_ALARM);
+    }
+  } catch (e) {
+    console.warn('DigitalData: failed to update the watchdog alarm', e);
+  }
+}
+
+// Fires once a minute while a job is in flight and covers the two ways a run
+// dies silently: the worker was suspended and nothing woke it up again, and the
+// worker is alive but its queue stopped producing results.
+async function watchdogTick() {
+  let record = null;
+  try {
+    const stored = await storageGet(JOB_KEY);
+    record = stored[JOB_KEY] || null;
+  } catch (e) {
+    return; // storage unreachable: nothing trustworthy to decide on
+  }
+  if (!record || record.status !== 'running') {
+    await ensureWatchdog(false);
+    return;
+  }
+
+  // No queue in memory: the worker was killed mid-run. Rebuild it from storage.
+  if (!activeJob) {
+    await maybeResume();
+    return;
+  }
+
+  const silentFor = Date.now() - activeJob.lastProgressAt;
+  if (silentFor < WATCHDOG_STALL_MS) return;
+
+  // Alive but mute: the queue is stuck on hung tabs. Drop it and let
+  // maybeResume() rebuild from the results already in storage, so nothing that
+  // finished gets processed twice.
+  console.warn(`DigitalData: watchdog restarting a stalled job (${Math.round(silentFor / 1000)}s without progress)`);
+  const stalled = activeJob;
+  stalled.handle.cancelled = true;
+  stalled.handle.superseded = true; // its finalize must not touch the new state
+  activeJob = null;
+  await closeOrphanTabs();
+  await maybeResume();
 }
 
 // ---- Queue ----
@@ -329,6 +493,9 @@ async function runQueue(job) {
       if (idx < 0) return;
 
       const entry = await processUrl(urls[idx], idx, job);
+      // A cancelled job must never write again: its progress payload is stale,
+      // and a watchdog restart would let it overwrite the newer queue's counters.
+      if (handle.cancelled) return;
       if (!(await persistEntry(job, idx, entry))) return;
     }
   }
@@ -337,9 +504,31 @@ async function runQueue(job) {
   await Promise.all(workers);
 }
 
+// Retries transient failures only: a throttled tab creation or a discarded tab
+// is the extension hiccuping, while a network error page or a load timeout is
+// the site's answer — retrying those would double the wall time for the same
+// verdict. The retry is invisible in the entry contract on purpose, so the
+// error messages stay comparable between runs.
 async function processUrl(url, idx, job) {
+  for (let attempt = 1; ; attempt++) {
+    const { entry, retryable } = await attemptUrl(url, idx, job);
+    if (!retryable || attempt >= RETRY_MAX_ATTEMPTS || job.handle.cancelled) {
+      return capEntry(entry, MAX_ENTRY_BYTES);
+    }
+    await sleep(jitter(RETRY_BASE_DELAY_MS));
+  }
+}
+
+// Full jitter so parallel workers do not retry in lockstep.
+function jitter(baseMs) {
+  return Math.round(baseMs * (1 + Math.random()));
+}
+
+// A single attempt: one tab, one read of the data layer.
+async function attemptUrl(url, idx, job) {
   const entry = { url, finalUrl: null, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
   let tab;
+  let retryable = false;
 
   try {
     await ensureFordCookie(url);
@@ -363,10 +552,13 @@ async function processUrl(url, idx, job) {
     // instead of reporting "sin digitalData" for a page that never loaded.
     if (loadOutcome === 'gone' || isErrorPageUrl(pageUrl)) {
       entry.status = 'error';
+      // A vanished tab may just have been discarded under memory pressure (worth
+      // a retry); an error page is the site's answer (not worth a retry).
+      retryable = loadOutcome === 'gone';
       entry.error = loadOutcome === 'gone'
         ? TAB_CLOSED_MESSAGE
         : 'Page failed to load: ' + pageUrl;
-      return capEntry(entry, MAX_ENTRY_BYTES);
+      return { entry, retryable };
     }
 
     await sleep(POST_LOAD_WAIT_MS);
@@ -400,6 +592,9 @@ async function processUrl(url, idx, job) {
   } catch (e) {
     entry.status = 'error';
     entry.error = e && e.message ? e.message : String(e);
+    // A throw here means the extension failed (tab creation throttled, injection
+    // rejected), not that the site answered: worth one retry.
+    retryable = true;
   } finally {
     if (tab) {
       untrackTab(job, tab.id);
@@ -409,7 +604,7 @@ async function processUrl(url, idx, job) {
     }
   }
 
-  return capEntry(entry, MAX_ENTRY_BYTES);
+  return { entry, retryable };
 }
 
 // ---- Wait for tab load ----
@@ -468,20 +663,30 @@ function untrackTab(job, tabId) {
   persistProgress(job);
 }
 
-// Close tabs recorded by a previous (suspended or aborted) run.
+// Close tabs recorded by a previous (suspended or aborted) run. Mid-run the
+// live list lives in ddProgress — ddJob only carries a tabIds snapshot from
+// start/finalize — so both are read, or a killed worker leaves its tabs open.
 async function closeOrphanTabs() {
   let record;
+  let progress;
   try {
-    const stored = await storageGet(JOB_KEY);
+    const stored = await storageGet([JOB_KEY, PROGRESS_KEY]);
     record = stored[JOB_KEY];
+    progress = stored[PROGRESS_KEY];
   } catch (e) {
     return;
   }
-  const ids = record && Array.isArray(record.tabIds) ? record.tabIds : [];
+  const ids = [];
+  if (record && Array.isArray(record.tabIds)) ids.push(...record.tabIds);
+  if (progress && Array.isArray(progress.tabIds)) ids.push(...progress.tabIds);
   await Promise.all(ids.map((id) => chrome.tabs.remove(id).catch(() => {})));
   if (record) {
     record.tabIds = [];
     await storageSet({ [JOB_KEY]: snapshot(record) }).catch(() => {});
+  }
+  if (progress) {
+    progress.tabIds = [];
+    await storageSet({ [PROGRESS_KEY]: progress }).catch(() => {});
   }
 }
 
@@ -500,6 +705,9 @@ function snapshot(record) {
 // Persist only the tiny progress object. The URL list lives in ddJob and is
 // written at start/finalize, so finishing one URL is O(1), not O(n).
 async function persistProgress(job) {
+  // A cancelled job must never write again: its payload is stale and could
+  // overwrite the counters of the queue that superseded it.
+  if (job.handle.cancelled) return false;
   try {
     await job.write({ [PROGRESS_KEY]: progressPayload(job) });
     return true;

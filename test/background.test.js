@@ -16,10 +16,12 @@ function clone(value) {
 
 function createWorker(options = {}) {
   const store = new Map();
-  const tabs = { nextId: 1, live: new Map(), removed: [] };
-  const listeners = { message: [], startup: [], installed: [], updated: [] };
+  const tabs = { nextId: 1, live: new Map(), removed: [], created: [], attempts: 0 };
+  const alarms = { created: [], cleared: [] };
+  const listeners = { message: [], startup: [], installed: [], updated: [], alarm: [] };
   const failSetOn = { key: options.failSetOn || null, message: options.failMessage || 'QUOTA_BYTES quota exceeded' };
   const payload = options.payload || { dd: { page: { pageInfo: { pageName: 'test' } } }, aa: null };
+  let failTabCreate = !!options.failFirstTabCreate;
 
   Object.keys(options.seed || {}).forEach((key) => store.set(key, clone(options.seed[key])));
 
@@ -64,7 +66,20 @@ function createWorker(options = {}) {
     storage: { local: { get, set, remove, onChanged: { addListener: () => {} } } },
     tabs: {
       create: async ({ url }) => {
+        // The extension's own results tab is not a page load: it must not be
+        // counted as an attempt when a test is checking retry behaviour.
+        if (url.indexOf('chrome-extension://') === 0) {
+          const id = tabs.nextId++;
+          tabs.live.set(id, { id, url, status: 'complete' });
+          return { id, url, status: 'complete' };
+        }
+        tabs.attempts++;
+        if (failTabCreate) {
+          failTabCreate = false;
+          throw new Error('Tabs cannot be edited right now (user may be dragging a tab)');
+        }
         const id = tabs.nextId++;
+        tabs.created.push(id);
         tabs.live.set(id, { id, url, status: 'complete' });
         return { id, url, status: 'complete' };
       },
@@ -84,6 +99,11 @@ function createWorker(options = {}) {
       executeScript: async () => [{ result: clone(payload) }]
     },
     cookies: { set: async () => {} },
+    alarms: {
+      create: async (name, info) => { alarms.created.push({ name, info }); },
+      clear: async (name) => { alarms.cleared.push(name); },
+      onAlarm: { addListener: (fn) => listeners.alarm.push(fn) }
+    },
     declarativeNetRequest: { updateDynamicRules: async () => {} }
   };
 
@@ -152,7 +172,31 @@ function createWorker(options = {}) {
     return [...store.keys()].filter((key) => key.indexOf('ddR:') === 0);
   }
 
-  return { chrome, store, tabs, sandbox: context, send, waitForJobEnd, snapshot, resultKeys };
+  // Reaches top-level `let` bindings of the worker (activeJob, resumeInFlight)
+  // which are not properties of the sandbox object.
+  function evaluate(code) {
+    return vm.runInContext(code, vmContext);
+  }
+
+  // Simulates the browser firing the watchdog alarm.
+  function fireAlarm(name = 'ddWatchdog') {
+    listeners.alarm.slice().forEach((fn) => fn({ name }));
+    return new Promise((resolve) => setTimeout(resolve, 60));
+  }
+
+  return {
+    chrome,
+    store,
+    tabs,
+    alarms,
+    sandbox: context,
+    send,
+    waitForJobEnd,
+    snapshot,
+    resultKeys,
+    evaluate,
+    fireAlarm
+  };
 }
 
 const URLS = [
@@ -255,6 +299,165 @@ describe('background load classification', () => {
     const entry = worker.snapshot()['ddR:0'];
     assert.equal(entry.status, 'error');
     assert.match(entry.error, /Tab closed/);
+  });
+});
+
+describe('cancellation', () => {
+  it('stops a running job, keeps the partial results readable and leaves a marker', async () => {
+    const worker = createWorker();
+    const started = await worker.send({ type: 'START_JOB', urls: URLS });
+    assert.equal(started.ok, true);
+
+    const cancelled = await worker.send({ type: 'CANCEL_JOB' });
+    assert.equal(cancelled.ok, true);
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(stored.ddJobRunning, false);
+    assert.equal(stored.ddJobError, 'cancelled');
+    assert.equal(stored.ddJob.status, 'cancelled');
+    assert.ok(worker.resultKeys().length < URLS.length, 'a cancelled run must not complete');
+    // A cancelled job must not write progress either: the counters have to match
+    // the results actually on disk.
+    assert.equal(stored.ddProgress.done, worker.resultKeys().length);
+  });
+
+  it('clears a zombie running state the worker could not resume', async () => {
+    // A record marked running with no usable URL list: maybeResume() refuses it,
+    // so only an explicit cancel can clear the state the popup is showing.
+    const worker = createWorker({
+      seed: {
+        ddJob: { status: 'running', urls: [], nextIndex: 0, startedAt: Date.now(), tabIds: [] },
+        ddJobRunning: true,
+        ddTotal: 0
+      }
+    });
+
+    const cancelled = await worker.send({ type: 'CANCEL_JOB' });
+    assert.equal(cancelled.ok, true);
+
+    const stored = worker.snapshot();
+    assert.equal(stored.ddJobRunning, false);
+    assert.equal(stored.ddJobError, 'cancelled');
+    assert.equal(stored.ddJob.status, 'cancelled');
+  });
+
+  it('reports no job to cancel when nothing is running', async () => {
+    const worker = createWorker();
+    const cancelled = await worker.send({ type: 'CANCEL_JOB' });
+    assert.deepEqual(clone(cancelled), { ok: false, reason: 'no-job' });
+  });
+
+  it('lets a new run start over a cancelled job that is still draining', async () => {
+    const worker = createWorker();
+    await worker.send({ type: 'START_JOB', urls: URLS });
+    await worker.send({ type: 'CANCEL_JOB' });
+
+    const restarted = await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    assert.equal(restarted.ok, true);
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(stored.ddTotal, 1);
+    assert.equal(stored.ddJobError, undefined, 'the new run clears the cancelled marker');
+    assert.equal(stored.ddJob.status, 'idle');
+  });
+});
+
+describe('watchdog', () => {
+  it('arms the alarm while a job runs and clears it when the job ends', async () => {
+    const worker = createWorker();
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    assert.deepEqual(worker.alarms.created.map((a) => a.name), ['ddWatchdog']);
+    assert.ok(worker.alarms.cleared.includes('ddWatchdog'));
+  });
+
+  it('resumes a job whose worker died and never woke up', async () => {
+    const worker = createWorker({
+      seed: {
+        ddJob: { status: 'running', urls: URLS, nextIndex: 0, startedAt: Date.now(), tabIds: [] },
+        ddJobRunning: true,
+        ddTotal: URLS.length
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Simulate the kill: the in-memory queue is gone, storage still says running.
+    worker.evaluate('activeJob.handle.cancelled = true; activeJob.handle.superseded = true; activeJob = null;');
+    assert.equal(worker.snapshot().ddJobRunning, true, 'the run stays stuck until something wakes it');
+
+    await worker.fireAlarm();
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(stored.ddProgress.done, URLS.length);
+    assert.equal(stored.ddJob.status, 'idle');
+    assert.deepEqual(worker.resultKeys().sort(), ['ddR:0', 'ddR:1', 'ddR:2', 'ddR:3', 'ddR:4']);
+  });
+
+  it('restarts a queue that stopped producing results', async () => {
+    const worker = createWorker();
+    await worker.send({ type: 'START_JOB', urls: URLS });
+    // Pretend the queue went mute two minutes ago while its tabs hang.
+    worker.evaluate('activeJob.lastProgressAt = Date.now() - 300000');
+
+    await worker.fireAlarm();
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(stored.ddProgress.done, URLS.length);
+    assert.equal(stored.ddJob.status, 'idle');
+    assert.equal(worker.resultKeys().length, URLS.length);
+    assert.equal(stored.ddJobError, undefined, 'a watchdog restart is not a failure');
+  });
+
+  it('closes the tabs the killed worker left behind', async () => {
+    const worker = createWorker();
+    await worker.send({ type: 'START_JOB', urls: URLS });
+    // Give the workers a beat to open their tabs and persist the live ids.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const progress = worker.snapshot().ddProgress;
+    assert.equal(progress.tabIds.length, URLS.length, 'live tab ids must be persisted');
+
+    worker.evaluate('activeJob.handle.cancelled = true; activeJob.handle.superseded = true; activeJob = null;');
+    await worker.fireAlarm();
+    await worker.waitForJobEnd();
+
+    // Every tab opened by the first queue is closed: 5 orphans + 5 from the
+    // restarted queue.
+    URLS.forEach((_, i) => assert.ok(worker.tabs.removed.includes(i + 1), `tab ${i + 1} must be closed`));
+  });
+
+  it('clears the alarm when the alarm finds no running job', async () => {
+    const worker = createWorker();
+    await worker.fireAlarm();
+    assert.ok(worker.alarms.cleared.includes('ddWatchdog'));
+  });
+});
+
+describe('retry', () => {
+  it('retries a transient tab failure and keeps the data', async () => {
+    const worker = createWorker({ failFirstTabCreate: true });
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    const entry = worker.snapshot()['ddR:0'];
+    assert.equal(entry.status, 'ok');
+    assert.equal(entry.digitalData.page.pageInfo.pageName, 'test');
+    assert.equal(worker.tabs.created.length, 1, 'the retry must not leave a second page open');
+    assert.equal(worker.tabs.attempts, 2, 'the failed attempt must be retried');
+  });
+
+  it('does not retry a network error page', async () => {
+    const worker = createWorker({ finalUrl: 'chrome-error://chromewebdata/' });
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    const entry = worker.snapshot()['ddR:0'];
+    assert.equal(entry.status, 'error');
+    assert.match(entry.error, /Page failed to load/);
+    assert.equal(worker.tabs.attempts, 1, "the site's answer must not be retried");
   });
 });
 
