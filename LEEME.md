@@ -32,6 +32,7 @@
 ## Configuración opcional (background.js)
 - `POST_LOAD_WAIT_MS`: espera extra tras cargar la página antes de buscar el objeto (por defecto 1.5s).
 - `DIGITALDATA_MAX_WAIT_MS`: tiempo máximo reintentando buscar `window.digitalData` dentro de la página (por defecto 8s).
+- `DIGITALDATA_STABLE_POLLS`: cuántos polls seguidos con el mismo contenido debe mantener `digitalData` para aceptarlo (por defecto 2 → ~500ms extra por página con dato). Bajarlo a 1 acelera pero vuelve a aceptar payloads parciales.
 - `CLOSE_TABS_AFTER_READ`: pon `false` si quieres que las pestañas se queden abiertas en vez de cerrarse solas.
 - `CONCURRENCY`: cuántas URLs se procesan en paralelo (por defecto 5). Con listas de decenas o cientos de enlaces, la extensión ya no abre todas las pestañas de golpe: va tomando URLs de la cola de a `CONCURRENCY` a la vez, lo cual evita saturar Chrome y reduce el riesgo de que un sitio te bloquee por exceso de peticiones simultáneas. Puedes subirlo si tu equipo aguanta más carga, o bajarlo si notas lentitud/errores.
 
@@ -42,6 +43,8 @@
 
 ## Verdad del dato (rama perf/*)
 - Cada entry guarda `finalUrl` (URL post-redirect, o `chrome-error://` si la página nunca cargó): el data layer pertenece a ESA página. Si difiere de la pedida, la tarjeta lo muestra en amarillo.
+- Un `digitalData` definido pero **vacío** ya no cuenta como dato: se espera a que tenga contenido y se mantenga igual durante `DIGITALDATA_STABLE_POLLS` polls (por defecto 2). Antes el primer objeto truthy —aunque fuera `{}`— cortaba la espera y se reportaba como OK.
+- Un timeout de carga (25s) o una página de error de red (`chrome-error://`) se reportan como **error**, no como "sin digitalData": antes la auditoría culpaba al sitio por una página que la extensión nunca llegó a leer.
 - Paridad entre ramas: corre el mismo set en ambas, descarga el DD de cada una y compara con `npm run parity -- base-dd.json perf-dd.json` (exit 0 = paridad, 1 = divergencia). Adoptar perf solo con paridad total.
 
 ## Notas
@@ -61,9 +64,10 @@ memoria. Ahora:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 49 tests (urls, formato, resultados, quota, contrato de export y
-  un arnés de integración de `background.js` con la API de Chrome simulada:
-  layout por URL, reanudación y aborto por cuota).
+- `npm test` — 60 tests (urls, formato, resultados, quota, estado de carga,
+  contrato de export y un arnés de integración de `background.js` con la API de
+  Chrome simulada: layout por URL, reanudación, aborto por cuota, página de error
+  y extractor de `digitalData`).
 - `node --test --experimental-test-coverage test/` — medición (~99% líneas en `lib/`).
 El `test/contract.test.js` valida el schema que consumen importadores externos
 ( p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de

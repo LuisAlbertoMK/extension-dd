@@ -69,9 +69,10 @@ function createWorker(options = {}) {
         return { id, url, status: 'complete' };
       },
       get: async (id) => {
+        if (options.dropTabs) throw new Error('No tab with id ' + id);
         const tab = tabs.live.get(id);
         if (!tab) throw new Error('No tab with id ' + id);
-        return { ...tab, status: 'complete' };
+        return { ...tab, status: 'complete', url: options.finalUrl || tab.url };
       },
       remove: async (id) => {
         tabs.removed.push(id);
@@ -105,6 +106,7 @@ function createWorker(options = {}) {
     URL
   };
   context.globalThis = context;
+  if (options.page) context.window = options.page;
   const vmContext = vm.createContext(context);
   context.importScripts = (...files) => {
     files.forEach((file) => {
@@ -150,7 +152,7 @@ function createWorker(options = {}) {
     return [...store.keys()].filter((key) => key.indexOf('ddR:') === 0);
   }
 
-  return { chrome, store, tabs, send, waitForJobEnd, snapshot, resultKeys };
+  return { chrome, store, tabs, sandbox: context, send, waitForJobEnd, snapshot, resultKeys };
 }
 
 const URLS = [
@@ -230,5 +232,63 @@ describe('background job persistence', () => {
     assert.ok(worker.resultKeys().length >= 1, 'partial results must survive');
     assert.ok(worker.resultKeys().length < 3, 'the failing write must not be counted');
     assert.equal(stored.ddProgress.done, worker.resultKeys().length);
+  });
+});
+
+describe('background load classification', () => {
+  it('reports a network error page as an error instead of no-data', async () => {
+    const worker = createWorker({ finalUrl: 'chrome-error://chromewebdata/' });
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    const entry = worker.snapshot()['ddR:0'];
+    assert.equal(entry.status, 'error');
+    assert.match(entry.error, /Page failed to load/);
+    assert.equal(entry.digitalData, null);
+  });
+
+  it('reports a tab closed before it could be read as an error', async () => {
+    const worker = createWorker({ dropTabs: true });
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    const entry = worker.snapshot()['ddR:0'];
+    assert.equal(entry.status, 'error');
+    assert.match(entry.error, /Tab closed/);
+  });
+});
+
+describe('extractPageAnalytics', () => {
+  it('ignores an empty digitalData and waits until it is populated', async () => {
+    const page = { digitalData: {} };
+    const worker = createWorker({ page });
+    setTimeout(() => { page.digitalData = { page: { pageInfo: { pageName: 'late' } } }; }, 30);
+
+    const result = await worker.sandbox.extractPageAnalytics(300, 10, 2);
+    assert.equal(result.dd.page.pageInfo.pageName, 'late');
+  });
+
+  it('reports no digitalData when the object stays empty until the timeout', async () => {
+    const worker = createWorker({ page: { digitalData: {} } });
+    const result = await worker.sandbox.extractPageAnalytics(60, 10, 2);
+    assert.equal(result.dd, null);
+  });
+
+  it('accepts a payload that stays identical for the required polls', async () => {
+    const page = { digitalData: { page: { pageInfo: { pageName: 'stable' } } } };
+    const worker = createWorker({ page });
+    const result = await worker.sandbox.extractPageAnalytics(300, 10, 2);
+    assert.equal(result.dd.page.pageInfo.pageName, 'stable');
+  });
+
+  it('falls back to the last seen payload when it never stabilizes', async () => {
+    const page = { digitalData: { n: 0 } };
+    const worker = createWorker({ page });
+    let n = 0;
+    const timer = setInterval(() => { n++; page.digitalData = { n }; }, 10);
+
+    const result = await worker.sandbox.extractPageAnalytics(80, 10, 2);
+    clearInterval(timer);
+    assert.ok(result.dd && result.dd.n > 0, 'expected the last observed payload');
   });
 });
