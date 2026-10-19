@@ -65,6 +65,40 @@ test('different URL lists make the comparison invalid', () => {
   assert.ok(result.findings.some((f) => f.level === 'blocker' && f.message.includes('Different URL lists')));
 });
 
+test('a run that stopped early is invalid, naming how far it got', () => {
+  const base = { ...summary({ ok: 110, noData: 229, error: 29 }), expectedTotal: 368 };
+  const cand = { ...summary({ ok: 110, noData: 220, error: 30 }), expectedTotal: 368 };
+  const result = compareSummaries(base, cand);
+  assert.strictEqual(result.verdict, 'invalid');
+  const blocker = result.findings.find((f) => f.level === 'blocker' && f.message.includes('Incomplete run'));
+  assert.ok(blocker, 'expected an incomplete-run blocker');
+  assert.match(blocker.message, /candidate stopped at 360\/368/);
+  assert.doesNotMatch(blocker.message, /base stopped/);
+  // A short run is not a different list: that message would send you hunting
+  // for the wrong problem.
+  assert.ok(result.findings.every((f) => !f.message.includes('Different URL lists')));
+});
+
+test('two runs that both stopped early are invalid even with identical totals', () => {
+  // Both at 300 of 1106: the list check alone sees equal totals and would let a
+  // meaningless comparison through.
+  const base = { ...summary({ ok: 100, noData: 180, error: 20 }), expectedTotal: 1106 };
+  const cand = { ...summary({ ok: 100, noData: 180, error: 20 }), expectedTotal: 1106 };
+  const result = compareSummaries(base, cand);
+  assert.strictEqual(result.verdict, 'invalid');
+  assert.ok(result.findings.some((f) => f.message.includes('base stopped at 300/1106')));
+  assert.ok(result.findings.some((f) => f.message.includes('candidate stopped at 300/1106')));
+});
+
+test('exports without expectedTotal keep the previous behaviour', () => {
+  const base = summary({ ok: 110, noData: 229, error: 29 });
+  const cand = summary({ ok: 110, noData: 219, error: 39, avgMsPerUrl: 10300, topErrors: [{ message: 'Timeout waiting for page load', count: 10 }] });
+  assert.strictEqual(base.expectedTotal, undefined);
+  const result = compareSummaries(base, cand);
+  assert.strictEqual(result.verdict, 'adopt');
+  assert.ok(result.findings.every((f) => !f.message.includes('Incomplete run')));
+});
+
 test('a summary whose statuses do not add up is a blocker', () => {
   const base = summary({ ok: 10, noData: 5, total: 368 });
   const cand = summary({ ok: 10, noData: 5, total: 368 });

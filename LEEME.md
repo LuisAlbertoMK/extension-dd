@@ -54,7 +54,7 @@ Adoptar la rama `perf/*` sin medirla es fe. El procedimiento:
 2. Corre el set en la base (`checkpoint/pre-fase1`), recarga la extensión en `chrome://extensions`, corre el mismo set en la rama perf: mismo día, misma máquina, misma red.
 3. Descarga el resumen de cada corrida y compáralos con
    `npm run compare -- base-resumen.json perf-resumen.json` (exit 0 = adoptar, 1 = ajustar/rechazar, 2 = input inválido).
-   El comando verifica que la lista coincida, que `ok` no baje, que los errores nuevos expliquen los "sin digitalData" que faltan, y que el tiempo por URL no suba más de 15% (25% bloquea).
+   El comando verifica que la lista coincida, que `ok` no baje, que los errores nuevos expliquen los "sin digitalData" que faltan, y que el tiempo por URL no suba más de 15% (25% bloquea). Una corrida que no terminó la lista se rechaza como **incompleta** (el export trae `expectedTotal`, el tamaño de la lista al arrancar) en vez de compararse: dos corridas cortadas en el mismo punto tendrían totales iguales y el veredicto sería humo.
 4. `npm run parity -- base-dd.json perf-dd.json` para el contenido del data layer, no solo los conteos.
 
 ## Notas

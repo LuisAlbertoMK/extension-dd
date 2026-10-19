@@ -84,6 +84,11 @@ test('missing arguments and unreadable input exit 2', () => {
   assert.equal(run(base, notASummary).status, 2);
   assert.equal(run(base, missing).status, 2);
   assert.match(run(base, notASummary).stdout, /not an audit summary/);
+
+  // A summary missing byEnv/adobe used to crash while printing the table.
+  const noEnv = write('no-env.json', { ...summary({ ok: 1, noData: 1, error: 1 }), byEnv: undefined });
+  assert.equal(run(base, noEnv).status, 2);
+  assert.match(run(base, noEnv).stdout, /missing byEnv\/adobe/);
 });
 
 test.after(() => {
