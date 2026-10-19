@@ -20,9 +20,31 @@ function ratio(candidate, base) {
   return candidate / base;
 }
 
+// The extension exports expectedTotal (the list size when the job started) next
+// to total (the URLs that actually produced a result), so total < expectedTotal
+// means the run stopped early. Older exports lack the field: fall back to total
+// and keep the previous behaviour.
+function expectedTotal(summary) {
+  const declared = summary.expectedTotal;
+  return typeof declared === 'number' && declared > 0 ? declared : summary.total;
+}
+
 function compareSummaries(base, candidate) {
   const findings = [];
   const add = (level, message) => findings.push({ level, message });
+
+  // Before anything else: a run that stopped early was not measured over the
+  // whole list, so no delta from it means anything. Two partial runs would
+  // otherwise agree on total and pass every check below.
+  const stopped = [];
+  if (base.total < expectedTotal(base)) stopped.push(`base stopped at ${base.total}/${expectedTotal(base)}`);
+  if (candidate.total < expectedTotal(candidate)) {
+    stopped.push(`candidate stopped at ${candidate.total}/${expectedTotal(candidate)}`);
+  }
+  if (stopped.length) {
+    add('blocker', `Incomplete run (${stopped.join('; ')}): a partial list cannot be compared. Rerun the incomplete side over the whole list.`);
+    return { verdict: 'invalid', findings, deltas: null };
+  }
 
   if (base.total !== candidate.total) {
     add('blocker', `Different URL lists: base ${base.total} vs candidate ${candidate.total}. Rerun both with the same input.`);
@@ -91,6 +113,11 @@ function load(file) {
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   if (!data || typeof data !== 'object' || !data.byStatus) {
     throw new Error(`${file}: not an audit summary (use "Descargar resumen")`);
+  }
+  // The report reads these directly: fail with a clear message instead of a
+  // TypeError halfway through printing the table.
+  if (!data.byEnv || !data.byEnv.prod || !data.byEnv.preview || !data.adobe) {
+    throw new Error(`${file}: summary is missing byEnv/adobe (re-export it with the current build)`);
   }
   return data;
 }
