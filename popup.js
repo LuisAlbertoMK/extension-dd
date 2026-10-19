@@ -5,19 +5,32 @@ const viewBtn = document.getElementById('viewResults');
 
 // parseUrls, isPreviewUrl and formatElapsed live in lib/ (loaded before this script).
 
+function describeJobError(code) {
+  switch (code) {
+    case 'storage-quota': return 'almacenamiento lleno';
+    case 'storage-write': return 'error de escritura';
+    case 'cancelled': return 'cancelada';
+    default: return code || 'error';
+  }
+}
+
 async function refreshStatus() {
-  const { ddJobRunning, ddTotal, ddResults, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
-    'ddJobRunning',
-    'ddTotal',
-    'ddResults',
-    'ddStartedAt',
-    'ddFinishedAt'
-  ]);
-  const done = ddResults ? Object.keys(ddResults).length : 0;
+  const { ddJobRunning, ddTotal, ddProgress, ddJobError, ddStartedAt, ddFinishedAt } =
+    await chrome.storage.local.get([
+      'ddJobRunning',
+      'ddTotal',
+      'ddProgress',
+      'ddJobError',
+      'ddStartedAt',
+      'ddFinishedAt'
+    ]);
+  const done = ddProgress && typeof ddProgress.done === 'number' ? ddProgress.done : 0;
   startBtn.disabled = !!ddJobRunning;
   const elapsed = formatElapsed(ddStartedAt, ddJobRunning ? Date.now() : ddFinishedAt);
   if (ddJobRunning) {
     statusEl.textContent = `Procesando... ${done}/${ddTotal || 0} completadas · ${elapsed}`;
+  } else if (ddJobError) {
+    statusEl.textContent = `Corrida detenida por ${describeJobError(ddJobError)} · ${done}/${ddTotal || done} procesadas. Pulsa "Ver resultados".`;
   } else if (ddTotal) {
     statusEl.textContent = `Última corrida: ${done}/${ddTotal} completadas en ${elapsed}. Pulsa "Ver resultados".`;
   } else {
