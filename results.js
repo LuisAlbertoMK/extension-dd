@@ -8,12 +8,14 @@ let lastMeta = { total: 0, running: false, startedAt: null, finishedAt: null, jo
 let reloadTimer = null;
 
 function metaFromStorage(raw) {
+  const job = raw.ddJob || {};
   return {
     total: raw.ddTotal || 0,
     running: !!raw.ddJobRunning,
     startedAt: raw.ddStartedAt,
     finishedAt: raw.ddFinishedAt,
-    jobError: raw.ddJobError || null
+    jobError: raw.ddJobError || null,
+    site: job.site || null
   };
 }
 
@@ -90,6 +92,23 @@ function buildCard(entry) {
     redir.textContent = '→ ' + entry.finalUrl;
     card.appendChild(redir);
   }
+  const chips = document.createElement('div');
+  chips.className = 'chips';
+  function chip(text, kind) {
+    const span = document.createElement('span');
+    span.className = 'chip' + (kind ? ' ' + kind : '');
+    span.textContent = text;
+    chips.appendChild(span);
+  }
+  if (entry.template === 'new') chip('Plantilla nueva', 'new');
+  else if (entry.template === 'old') chip('Plantilla legacy', 'old');
+  if (Array.isArray(entry.metrics_files) && entry.metrics_files.length) {
+    chip(entry.metrics_files.join(', '), 'metric');
+  }
+  if (entry.has_fmc_context) chip('FMC.context', 'fmc');
+  if (entry.has_aa_beacon) chip('Beacon AA', 'aa');
+  if (entry.links_found) chip(entry.links_found + ' enlaces', 'links');
+  if (chips.childNodes.length) card.appendChild(chips);
   card.appendChild(pre);
   return card;
 }
@@ -98,14 +117,19 @@ function renderSummary() {
   const meta = lastMeta;
   const done = lastEntries.length;
   const elapsed = formatElapsed(meta.startedAt, meta.running ? Date.now() : meta.finishedAt);
+  const sitemapErrors = meta.site && Array.isArray(meta.site.sitemapErrors) ? meta.site.sitemapErrors.length : 0;
+  const cappedNote = meta.site && meta.site.capped ? ' · tope de URLs alcanzado' : '';
+  const siteNote = meta.site
+    ? ` · sitio (prof. ${meta.site.maxDepth})${sitemapErrors ? ` · sitemap no leído en ${sitemapErrors}` : ''}${cappedNote}`
+    : '';
   if (meta.jobError === 'cancelled') {
-    summaryEl.textContent = `Corrida cancelada · ${done}/${meta.total || done} procesadas · ${elapsed}`;
+    summaryEl.textContent = `Corrida cancelada · ${done}/${meta.total || done} procesadas · ${elapsed}${siteNote}`;
   } else if (meta.jobError) {
-    summaryEl.textContent = `Corrida detenida por ${describeJobError(meta.jobError)} · ${done}/${meta.total || done} procesadas · ${elapsed}`;
+    summaryEl.textContent = `Corrida detenida por ${describeJobError(meta.jobError)} · ${done}/${meta.total || done} procesadas · ${elapsed}${siteNote}`;
   } else if (meta.running) {
-    summaryEl.textContent = `Procesando... ${done}/${meta.total || 0} · ${elapsed}`;
+    summaryEl.textContent = `Procesando... ${done}/${meta.total || 0} · ${elapsed}${siteNote}`;
   } else {
-    summaryEl.textContent = `${done}/${meta.total || done} URLs procesadas en ${elapsed}`;
+    summaryEl.textContent = `${done}/${meta.total || done} URLs procesadas en ${elapsed}${siteNote}`;
   }
   renderStats(buildSummary(lastEntries, {
     startedAt: meta.startedAt,
@@ -167,7 +191,7 @@ async function loadResults() {
 
 async function refreshMeta() {
   const raw = await chrome.storage.local.get([
-    'ddTotal', 'ddJobRunning', 'ddStartedAt', 'ddFinishedAt', 'ddJobError'
+    'ddTotal', 'ddJobRunning', 'ddStartedAt', 'ddFinishedAt', 'ddJobError', 'ddJob'
   ]);
   lastMeta = metaFromStorage(raw);
   renderSummary();
@@ -202,6 +226,10 @@ function renderStats(summary) {
     `${summary.byEnv.preview.ok} / ${summary.byEnv.preview['no-data']} / ${summary.byEnv.preview.error}`);
   row('Truncados', String(summary.truncated));
   row('Con Adobe Analytics', `${summary.adobe.with} / ${summary.total}`);
+  row('Plantilla nueva / legacy',
+    `${summary.byTemplate.new} / ${summary.byTemplate.old}${summary.byTemplate.unknown ? ` (+${summary.byTemplate.unknown} sin dato)` : ''}`);
+  row('Con FMC.context', `${summary.fmcContext.with} / ${summary.total}`);
+  row('Con beacon Adobe', `${summary.aaBeacon.with} / ${summary.total}`);
   summary.topErrors.forEach((e) => row(`Top error ×${e.count}`, e.message));
   if (summary.byStatus.error > 0) {
     const btn = document.createElement('button');
@@ -334,7 +362,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   });
 
   if (keys.some((key) => key === 'ddJobRunning' || key === 'ddJobError' ||
-      key === 'ddFinishedAt' || key === 'ddStartedAt' || key === 'ddTotal')) {
+      key === 'ddFinishedAt' || key === 'ddStartedAt' || key === 'ddTotal' || key === 'ddJob')) {
     refreshMeta();
   }
 });

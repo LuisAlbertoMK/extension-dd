@@ -96,7 +96,13 @@ function createWorker(options = {}) {
       onUpdated: { addListener: (fn) => listeners.updated.push(fn), removeListener: () => {} }
     },
     scripting: {
-      executeScript: async () => [{ result: clone(payload) }]
+      executeScript: async (injection) => {
+        const tabId = injection && injection.target ? injection.target.tabId : null;
+        const tab = tabId ? tabs.live.get(tabId) : null;
+        const pageUrl = tab ? tab.url : null;
+        const result = options.payloadFor ? options.payloadFor(pageUrl) : payload;
+        return [{ result: clone(result) }];
+      }
     },
     cookies: { set: async () => {} },
     alarms: {
@@ -123,9 +129,11 @@ function createWorker(options = {}) {
     Date,
     Math,
     Error,
-    URL
+    URL,
+    AbortController
   };
   context.globalThis = context;
+  if (options.fetch) context.fetch = options.fetch;
   if (options.page) context.window = options.page;
   const vmContext = vm.createContext(context);
   context.importScripts = (...files) => {
@@ -493,5 +501,147 @@ describe('extractPageAnalytics', () => {
     const result = await worker.sandbox.extractPageAnalytics(80, 10, 2);
     clearInterval(timer);
     assert.ok(result.dd && result.dd.n > 0, 'expected the last observed payload');
+  });
+});
+
+describe('site mode', () => {
+  const KEY_SCRIPTS = ['https://www.ford.mx/acservices/metrics.ford.es_mx.js'];
+
+  function pagePayload(overrides = {}) {
+    return Object.assign({
+      dd: { page: { pageInfo: { pageName: 'p' } } },
+      aa: null,
+      page: { title: 'Titulo', scripts: [], links: [], fmc_blocks: 0, has_aa_beacon: false }
+    }, overrides);
+  }
+
+  function sitemap(locs) {
+    return '<urlset>' + locs.map((u) => '<url><loc>' + u + '</loc></url>').join('') + '</urlset>';
+  }
+
+  it('expands the queue from the sitemap and classifies the template marker', async () => {
+    const xml = sitemap(['https://shop.example/a', 'https://shop.example/b']);
+    const worker = createWorker({
+      fetch: async () => ({ ok: true, text: async () => xml }),
+      payloadFor: () => pagePayload({ page: { title: 'Titulo', scripts: KEY_SCRIPTS, links: [], fmc_blocks: 2, has_aa_beacon: true } })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example'], site: { maxDepth: 1 } });
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(worker.tabs.created.length, 3, 'seed + 2 sitemap URLs');
+    assert.deepEqual(worker.resultKeys().sort(), ['ddR:0', 'ddR:1', 'ddR:2']);
+    assert.equal(stored.ddJob.site.discovered, 2);
+    assert.equal(stored.ddJob.depths[1], 1, 'sitemap entries are depth 1');
+
+    const entry = stored['ddR:1'];
+    assert.equal(entry.template, 'new');
+    assert.deepEqual(entry.metrics_files, ['/acservices/metrics.ford.es_mx.js']);
+    assert.equal(entry.metrics_locale, 'es_mx');
+    assert.equal(entry.has_aa_beacon, true);
+    assert.equal(entry.has_fmc_context, true);
+    assert.equal(entry.title, 'Titulo');
+  });
+
+  it('crawls links only up to maxDepth', async () => {
+    const xml = sitemap(['https://shop.example/a']);
+    const worker = createWorker({
+      fetch: async () => ({ ok: true, text: async () => xml }),
+      payloadFor: (url) => pagePayload({
+        page: {
+          title: '',
+          scripts: [],
+          links: url && url.endsWith('/a') ? ['https://shop.example/deep'] : [],
+          fmc_blocks: 0,
+          has_aa_beacon: false
+        }
+      })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example'], site: { maxDepth: 1 } });
+    await worker.waitForJobEnd();
+
+    assert.equal(worker.tabs.created.length, 2, 'seed + /a');
+    assert.deepEqual(worker.resultKeys().sort(), ['ddR:0', 'ddR:1']);
+  });
+
+  it('dedupes the same page found by sitemap and by a link', async () => {
+    const xml = sitemap(['https://shop.example/a', 'https://shop.example/a/']);
+    const worker = createWorker({
+      fetch: async () => ({ ok: true, text: async () => xml }),
+      payloadFor: () => pagePayload({
+        page: { title: '', scripts: [], links: ['https://shop.example/a'], fmc_blocks: 0, has_aa_beacon: false }
+      })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example/'], site: { maxDepth: 2 } });
+    await worker.waitForJobEnd();
+
+    assert.equal(worker.tabs.created.length, 2, 'the seed and /a run exactly once');
+    assert.equal(worker.snapshot().ddJob.site.discovered, 1);
+  });
+
+  it('ignores links to other hosts and to assets', async () => {
+    const worker = createWorker({
+      fetch: async () => ({ ok: true, text: async () => sitemap([]) }),
+      payloadFor: () => pagePayload({
+        page: {
+          title: '',
+          scripts: [],
+          links: ['https://other.example/x', 'https://shop.example/manual.pdf', 'https://shop.example/ok'],
+          fmc_blocks: 0,
+          has_aa_beacon: false
+        }
+      })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example/'], site: { maxDepth: 2 } });
+    await worker.waitForJobEnd();
+
+    assert.deepEqual(worker.resultKeys().sort(), ['ddR:0', 'ddR:1']);
+    assert.equal(worker.snapshot()['ddR:1'].url, 'https://shop.example/ok');
+  });
+
+  it('keeps the full link list out of the stored entry', async () => {
+    const worker = createWorker({
+      fetch: async () => ({ ok: true, text: async () => sitemap([]) }),
+      payloadFor: () => pagePayload({
+        page: { title: '', scripts: [], links: ['https://shop.example/x'], fmc_blocks: 0, has_aa_beacon: false }
+      })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example/'], site: { maxDepth: 1 } });
+    await worker.waitForJobEnd();
+
+    const entry = worker.snapshot()['ddR:0'];
+    assert.equal(entry.links_found, 1);
+    assert.equal(entry.links, undefined, 'links stay in memory, only the count is persisted');
+  });
+
+  it('still audits the seeds when the sitemap cannot be read', async () => {
+    const worker = createWorker({
+      fetch: async () => ({ ok: false, status: 403, text: async () => '' })
+    });
+
+    await worker.send({ type: 'START_JOB', urls: ['https://shop.example/'], site: { maxDepth: 1 } });
+    await worker.waitForJobEnd();
+
+    const stored = worker.snapshot();
+    assert.equal(worker.resultKeys().length, 1);
+    assert.equal(stored.ddJob.site.discoveredDone, true);
+    assert.equal(stored.ddJob.site.sitemapErrors.length, 1);
+  });
+
+  it('does not touch fetch or add site fields in plain URL-list mode', async () => {
+    let fetched = 0;
+    const worker = createWorker({ fetch: async () => { fetched++; return { ok: true, text: async () => '' }; } });
+
+    await worker.send({ type: 'START_JOB', urls: [URLS[0]] });
+    await worker.waitForJobEnd();
+
+    assert.equal(fetched, 0);
+    assert.equal(worker.snapshot().ddJob.site, null);
+    assert.equal(worker.snapshot()['ddR:0'].template, null);
   });
 });

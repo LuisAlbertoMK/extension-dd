@@ -76,6 +76,27 @@
     word-break: break-all;
     background: #1f2937;
   }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 14px;
+    background: #1f2937;
+  }
+  .chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid #374151;
+    color: #d1d5db;
+    word-break: break-all;
+  }
+  .chip.new { border-color: #16a34a; color: #86efac; }
+  .chip.old { border-color: #f59e0b; color: #fcd34d; }
+  .chip.metric { border-color: #6366f1; color: #c7d2fe; }
+  .chip.fmc { border-color: #0ea5e9; color: #bae6fd; }
+  .chip.aa { border-color: #8b5cf6; color: #ddd6fe; }
+  .chip.links { border-color: #4b5563; }
   .toolbar {
     display: flex;
     gap: 10px;

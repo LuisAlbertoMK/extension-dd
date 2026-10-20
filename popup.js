@@ -3,6 +3,20 @@ const statusEl = document.getElementById('status');
 const startBtn = document.getElementById('start');
 const cancelBtn = document.getElementById('cancel');
 const viewBtn = document.getElementById('viewResults');
+const siteModeEl = document.getElementById('siteMode');
+const siteOptsEl = document.getElementById('siteOpts');
+const siteDepthEl = document.getElementById('siteDepth');
+const hintEl = document.querySelector('.hint');
+
+// In site mode the textarea holds seed hosts (one per line): the worker fetches
+// each host sitemap and then walks same-host links up to the chosen depth.
+siteModeEl.addEventListener('change', () => {
+  const on = siteModeEl.checked;
+  siteOptsEl.hidden = !on;
+  hintEl.textContent = on
+    ? 'Pega un host semilla por línea (ej. https://www.ford.mx). Se suman sitemap + enlaces.'
+    : 'Pega una URL por línea.';
+});
 
 // parseUrls, isPreviewUrl and formatElapsed live in lib/ (loaded before this script).
 
@@ -75,7 +89,11 @@ startBtn.addEventListener('click', async () => {
         return;
       }
     }
-    const res = await chrome.runtime.sendMessage({ type: 'START_JOB', urls });
+    const res = await chrome.runtime.sendMessage({
+      type: 'START_JOB',
+      urls,
+      site: siteModeEl.checked ? { maxDepth: Number(siteDepthEl.value) } : null
+    });
     if (res && res.ok === false) {
       startBtn.disabled = false;
       statusEl.textContent = res.reason === 'already-running'
