@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { compareDiagnoses } = require('../lib/diagnose.js');
-const { parseArgs, main, describeRulesVersion } = require('../tools/compare-diagnosis.js');
+const { parseArgs, main, describeRulesVersion, describeCompleteness } = require('../tools/compare-diagnosis.js');
 
 function verdict(index, codes, extra) {
   return Object.assign({
@@ -160,5 +160,33 @@ describe('compare-diagnosis CLI', () => {
     const base = tempFile('base.json', '\uFEFF' + JSON.stringify([verdict(0)]));
     const candidate = tempFile('candidate.json', JSON.stringify([verdict(0)]));
     assert.equal(quiet(() => main([base, candidate])).code, 0);
+  });
+});
+
+describe('describeCompleteness', () => {
+  const complete = { completeness: { expectedTotal: 2, captured: 2, missing: [], complete: true } };
+  const short = {
+    completeness: {
+      expectedTotal: 3,
+      captured: 2,
+      missing: [{ index: 1, url: 'https://www.ford.mx/mi-ford/manual-propietario/' }],
+      cancelled: true,
+      complete: false
+    }
+  };
+
+  it('says nothing when both sides captured the whole queue', () => {
+    assert.deepEqual(describeCompleteness(complete, complete), []);
+  });
+
+  it('names the side, the shortfall and the missing URL', () => {
+    const lines = describeCompleteness(complete, short);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /candidate capture is incomplete: 2\/3 \(cancelled\)/);
+    assert.match(lines[0], /#1 https:\/\/www\.ford\.mx\/mi-ford\/manual-propietario\//);
+  });
+
+  it('ignores arrays and envelopes without the field, so old exports still compare', () => {
+    assert.deepEqual(describeCompleteness([verdict(0)], { results: [] }), []);
   });
 });

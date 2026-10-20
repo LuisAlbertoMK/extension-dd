@@ -15,8 +15,21 @@ function metaFromStorage(raw) {
     startedAt: raw.ddStartedAt,
     finishedAt: raw.ddFinishedAt,
     jobError: raw.ddJobError || null,
-    site: job.site || null
+    site: job.site || null,
+    // The submitted queue, kept so an export can name the URLs that never ran.
+    urls: Array.isArray(job.urls) ? job.urls : []
   };
+}
+
+// Completeness of the run behind the current results: what was submitted versus
+// what produced an entry. Computed on demand for downloads, and from lastMeta for
+// the summary row.
+function completenessOf(meta, done) {
+  return captureCompleteness(
+    { urls: meta && meta.urls ? meta.urls : [] },
+    done,
+    { expectedTotal: meta ? meta.total : 0, cancelled: !!(meta && meta.jobError === 'cancelled') }
+  );
 }
 
 function describeJobError(code) {
@@ -176,7 +189,7 @@ function renderSummary() {
   renderStats(buildSummary(lastEntries, {
     startedAt: meta.startedAt,
     finishedAt: meta.running ? Date.now() : meta.finishedAt
-  }, classifyEnv), currentDiagnosis());
+  }, classifyEnv), currentDiagnosis(), completenessOf(meta, lastEntries.map(({ idx }) => idx)));
 }
 
 function renderList(entries) {
@@ -246,8 +259,21 @@ async function readStoredResults() {
   return collectResults(raw);
 }
 
+// One full read that also carries what the results cannot say on their own:
+// which URLs were submitted, and whether the run finished them all.
+async function readSnapshot() {
+  const raw = await chrome.storage.local.get(null);
+  const results = collectResults(raw);
+  const meta = metaFromStorage(raw);
+  return {
+    results,
+    meta,
+    completeness: completenessOf(meta, Object.keys(results))
+  };
+}
+
 // Renders the audit summary with textContent only (entries may carry untrusted strings).
-function renderStats(summary, diagnosis) {
+function renderStats(summary, diagnosis, completeness) {
   statsEl.innerHTML = '';
   function row(label, value) {
     const div = document.createElement('div');
@@ -274,6 +300,18 @@ function renderStats(summary, diagnosis) {
     `${summary.byTemplate.new} / ${summary.byTemplate.old}${summary.byTemplate.unknown ? ` (+${summary.byTemplate.unknown} sin dato)` : ''}`);
   row('Con FMC.context', `${summary.fmcContext.with} / ${summary.total}`);
   row('Con beacon Adobe', `${summary.aaBeacon.with} / ${summary.total}`);
+  if (completeness) {
+    // Never let the report look complete when it is not: a cancelled run drops
+    // the captures that were in flight and no other row would show it.
+    if (completeness.complete) {
+      row('Medici\u00f3n', `${completeness.captured}/${completeness.expectedTotal} URLs (completa)`);
+    } else {
+      row('Medici\u00f3n',
+        `${completeness.captured}/${completeness.expectedTotal} URLs` +
+        `${completeness.cancelled ? ' \u00b7 CORRIDA CANCELADA' : ''}` +
+        ` \u00b7 sin medir: ${completeness.notCaptured}`);
+    }
+  }
   if (diagnosis) {
     row('Con problemas', `${diagnosis.withProblems} / ${diagnosis.total}`);
     row('Problemas de sitio (alta/media/baja)',
@@ -328,13 +366,14 @@ function closeErrorModal() {
 }
 
 document.getElementById('downloadSummary').addEventListener('click', async () => {
-  const raw = await chrome.storage.local.get(null);
-  const summary = buildSummary(orderedResults(collectResults(raw)), {
-    startedAt: raw.ddStartedAt,
-    finishedAt: raw.ddFinishedAt
+  const snap = await readSnapshot();
+  const summary = buildSummary(orderedResults(snap.results), {
+    startedAt: snap.meta.startedAt,
+    finishedAt: snap.meta.finishedAt
   }, classifyEnv);
   summary.generatedAt = new Date().toISOString();
-  summary.expectedTotal = raw.ddTotal || summary.total;
+  summary.expectedTotal = snap.completeness.expectedTotal;
+  summary.completeness = snap.completeness;
   summary.extensionVersion = extensionVersion();
   const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -371,13 +410,20 @@ document.getElementById('downloadAA').addEventListener('click', async () => {
 });
 
 document.getElementById('downloadDiagnosis').addEventListener('click', async () => {
-  const results = await readStoredResults();
-  const items = orderedResults(results).map(({ idx, entry }) => Object.assign({}, entry, { index: idx }));
+  const snap = await readSnapshot();
+  const items = orderedResults(snap.results).map(({ idx, entry }) => Object.assign({}, entry, { index: idx }));
   const diagnoses = diagnoseEntries(items, DIAG_OPTIONS);
   downloadFile(`digitalData-problemas-${Date.now()}.json`, {
     generatedAt: new Date().toISOString(),
+    // When the run happened, next to when the diagnosis was produced: a report
+    // without its own date cannot be defended months later.
+    runStartedAt: snap.meta.startedAt || null,
+    runFinishedAt: snap.meta.finishedAt || null,
     extensionVersion: extensionVersion(),
     rulesVersion: RULES_VERSION,
+    // What was submitted versus what produced an entry. Without this the report
+    // cannot tell a finished run from one that was cancelled mid-queue.
+    completeness: snap.completeness,
     summary: summarizeDiagnosis(diagnoses),
     results: diagnoses
   });

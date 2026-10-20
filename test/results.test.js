@@ -10,9 +10,9 @@ const {
   buildCombinedJson,
   buildDDJson,
   buildAAJson,
-  buildSummary
+  buildSummary,
+  captureCompleteness
 } = require('../lib/results.js');
-
 describe('resultKey / collectResults', () => {
   it('builds one prefixed storage key per index', () => {
     assert.equal(RESULT_PREFIX, 'ddR:');
@@ -229,5 +229,61 @@ describe('buildSummary', () => {
     assert.deepEqual(s.byTemplate, { new: 1, old: 1, unknown: 1 });
     assert.deepEqual(s.fmcContext, { with: 1, without: 2 });
     assert.deepEqual(s.aaBeacon, { with: 1, without: 2 });
+  });
+});
+
+describe('captureCompleteness', () => {
+  const job = { urls: ['https://x.example/a', 'https://x.example/b', 'https://x.example/c'] };
+
+  it('reports a finished run against the submitted queue', () => {
+    const c = captureCompleteness(job, new Set([0, 1, 2]));
+    assert.equal(c.expectedTotal, 3);
+    assert.equal(c.captured, 3);
+    assert.equal(c.notCaptured, 0);
+    assert.deepEqual(c.missing, []);
+    assert.equal(c.basis, 'queue');
+    assert.equal(c.complete, true);
+  });
+
+  it('names the URL of a hole in the middle of the queue', () => {
+    // A cancelled job abandons the captures that were in flight: index 1 is gone
+    // while the tail kept running, so the results alone look plausible.
+    const c = captureCompleteness(job, ['0', '2']);
+    assert.equal(c.captured, 2);
+    assert.equal(c.notCaptured, 1);
+    assert.deepEqual(c.missing, [{ index: 1, url: 'https://x.example/b' }]);
+    assert.equal(c.complete, false);
+  });
+
+  it('refuses to call a cancelled run complete even with every index present', () => {
+    const c = captureCompleteness(job, [0, 1, 2], { cancelled: true });
+    assert.equal(c.notCaptured, 0);
+    assert.equal(c.cancelled, true);
+    assert.equal(c.complete, false);
+  });
+
+  it('falls back to index arithmetic when the queue is gone, and says so', () => {
+    const c = captureCompleteness(null, [0, 2], { expectedTotal: 3 });
+    assert.equal(c.basis, 'indices');
+    assert.equal(c.expectedTotal, 3);
+    assert.deepEqual(c.missing.map((m) => m.index), [1]);
+    assert.equal(c.missing[0].url, null);
+    assert.equal(c.complete, false);
+  });
+
+  it('cannot see a tail that never ran without the queue', () => {
+    // Only the queue can name the URLs that were never claimed; index arithmetic
+    // proves the captured range is hole-free, not that the run finished.
+    const c = captureCompleteness(null, [0, 1]);
+    assert.equal(c.expectedTotal, 2);
+    assert.equal(c.notCaptured, 0);
+    assert.equal(c.complete, true);
+    assert.equal(c.basis, 'indices');
+  });
+
+  it('treats an empty run as incomplete instead of vacuously complete', () => {
+    const c = captureCompleteness(null, []);
+    assert.equal(c.expectedTotal, 0);
+    assert.equal(c.complete, false);
   });
 });

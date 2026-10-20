@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const { diagnoseEntries, summarizeDiagnosis, RULES_VERSION } = require('../lib/diagnose.js');
+const { captureCompleteness } = require('../lib/results.js');
 const { validateExport } = require('../lib/schema.js');
 const { isPreviewUrl } = require('../lib/urls.js');
 
@@ -69,11 +70,16 @@ function main(argv) {
   }
 
   const results = diagnoseEntries(parsed, { isPreviewUrl });
+  // The combined array carries indices, not the submitted queue, so this can
+  // only prove there are no holes inside the captured range: a tail that never
+  // ran is invisible from here. The envelope says which basis was used.
+  const completeness = captureCompleteness(null, parsed.map((entry) => entry.index), {});
   const report = {
     generatedAt: new Date().toISOString(),
     // Which rules produced these verdicts. Without it, comparing this file
     // against a baseline taken under older rules looks like the site changed.
     rulesVersion: RULES_VERSION,
+    completeness,
     summary: summarizeDiagnosis(results),
     results
   };
@@ -91,6 +97,15 @@ function main(argv) {
     `Diagnosed ${summary.total} entries · ${summary.withProblems} with problems ` +
     `(site high/medium/low: ${summary.bySiteSeverity.high}/${summary.bySiteSeverity.medium}/${summary.bySiteSeverity.low})`
   );
+  if (!completeness.complete) {
+    // Loud on purpose: a report over a partial run is not a smaller report, it
+    // is a wrong one.
+    const holes = completeness.missing.map((m) => m.index).join(', ');
+    console.error(
+      `WARNING: capture is incomplete (${completeness.captured}/${completeness.expectedTotal} URLs, ` +
+      `missing index: ${holes}). Do not report these numbers as a full audit.`
+    );
+  }
   return 0;
 }
 
