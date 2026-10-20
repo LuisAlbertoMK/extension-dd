@@ -3,3 +3,4 @@ config.local.js
 
 # Local tooling noise
 .atl/
+.codegraph/
