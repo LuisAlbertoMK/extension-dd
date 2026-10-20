@@ -4,3 +4,11 @@ config.local.js
 # Local tooling noise
 .atl/
 .codegraph/
+
+# Local audit artifacts: input lists, tracker sheets and run exports.
+# Evidence, not source: they never travel with the code.
+/resultados/
+/Estatus URL.xlsx
+/problemas-dd-urls.txt
+/remedicion-*.json
+/remedicion-*.txt
