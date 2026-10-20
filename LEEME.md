@@ -45,19 +45,125 @@ La página de resultados agrega chips por tarjeta y filas de resumen (plantilla 
 - `DIGITALDATA_MAX_WAIT_MS`: tiempo máximo reintentando buscar `window.digitalData` dentro de la página (por defecto 8s).
 - `DIGITALDATA_STABLE_POLLS`: cuántos polls seguidos con el mismo contenido debe mantener `digitalData` para aceptarlo (por defecto 2 → ~500ms extra por página con dato). Bajarlo a 1 acelera pero vuelve a aceptar payloads parciales.
 - `CLOSE_TABS_AFTER_READ`: pon `false` si quieres que las pestañas se queden abiertas en vez de cerrarse solas.
-- `CONCURRENCY`: cuántas URLs se procesan en paralelo (por defecto 5). Con listas de decenas o cientos de enlaces, la extensión ya no abre todas las pestañas de golpe: va tomando URLs de la cola de a `CONCURRENCY` a la vez, lo cual evita saturar Chrome y reduce el riesgo de que un sitio te bloquee por exceso de peticiones simultáneas. Puedes subirlo si tu equipo aguanta más carga, o bajarlo si notas lentitud/errores.
+- `CONCURRENCY`: cuántas URLs se procesan en paralelo (por defecto **3**). Con listas de decenas o cientos de enlaces, la extensión no abre todas las pestañas de golpe: va tomando URLs de la cola de a `CONCURRENCY` a la vez.
+- `NAV_STAGGER_MS`: separación mínima entre el inicio de dos navegaciones (por defecto **800 ms**, más hasta 400 ms de jitter). Sumado a `CONCURRENCY=3` deja ~1 navegación por segundo: menos throughput, pero el borde (Akamai) no ve una ráfaga. Subilo si te bloquean; bajalo solo si sabés que la IP está allowlisteada.
 
 ## Rendimiento (rama perf/*)
-- Durante cada corrida se bloquean imágenes, video y fuentes vía `declarativeNetRequest` (`BLOCK_HEAVY_RESOURCES`): recorta segundos por página sin afectar data layers (scripts, XHR y documentos nunca se bloquean). Al terminar (o cancelar) la regla se retira sola, incluso si el worker muere a mitad.
-- Calibración con datos reales (368 URLs en 12m05s ≈ 9.9 s de carga por página en serie, ≈2 s por URL de reloj de pared con `CONCURRENCY=5`): si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s); si la máquina aguantó bien, sube `CONCURRENCY` (5→8). Riesgo: perder data layers tardíos.
+- Durante cada corrida se bloquean imágenes, video y fuentes vía `declarativeNetRequest` (`BLOCK_HEAVY_RESOURCES`): recorta segundos por página sin afectar data layers (scripts, XHR y documentos nunca se bloquean). Al terminar (o cancelar) la regla se retira sola, incluso si el worker muere a mitad. Si el sitio empieza a responder 403/429 (ver `edge-blocked`), probá con `BLOCK_HEAVY_RESOURCES=false`: un navegador que nunca pide imágenes es un perfil menos humano, y el costo es velocidad, no datos.
+- Calibración con datos reales (368 URLs en 12m05s ≈ 9.9 s de carga por página en serie, con `CONCURRENCY=5`): el ritmo ya no lo fija solo la concurrencia sino `NAV_STAGGER_MS`, que serializa los arranques (~1 navegación/s con el default). Subir `CONCURRENCY` sin bajar el stagger no acelera nada. Si tu `digitalData` aparece temprano, baja `DIGITALDATA_MAX_WAIT_MS` (8s→4s) y `POST_LOAD_WAIT_MS` (1.5s→0.8s). Riesgo: perder data layers tardíos.
 - Diferido a propósito: caché entre corridas (en auditoría, saltear URLs es dato rancio — solo tendría sentido como modo opt-in "qué cambió") y pool de tabs (invasivo en el `runQueue` actual para la ganancia que da).
 - Un reintento transitorio cuesta hasta `RETRY_BASE_DELAY_MS` (400 ms) con jitter, y solo se paga cuando falla la infraestructura (no en páginas lentas ni en errores de red, que no se reintentan).
 
 ## Verdad del dato (rama perf/*)
 - Cada entry guarda `finalUrl` (URL post-redirect, o `chrome-error://` si la página nunca cargó): el data layer pertenece a ESA página. Si difiere de la pedida, la tarjeta lo muestra en amarillo.
 - Un `digitalData` definido pero **vacío** ya no cuenta como dato: se espera a que tenga contenido y se mantenga igual durante `DIGITALDATA_STABLE_POLLS` polls (por defecto 2). Antes el primer objeto truthy —aunque fuera `{}`— cortaba la espera y se reportaba como OK.
+- Un `digitalData` **con estructura pero sin identidad** (`pageName`, `hierarchy`, `siteSection`, `pageType`, `pageDomain`) también se sigue esperando: el loader crea `page.descriptor`/`page.tool` primero y completa la identidad después. Medido en producción: la misma URL devolvió el page block completo en una corrida y el cascarón en la siguiente, con Adobe Analytics ya informando el `pageName`. Sin esta espera, "DD a medio inicializar" y "DD ausente" son indistinguibles — y el reporte culpaba al sitio por lo primero. Si la identidad no aparece antes de `DIGITALDATA_MAX_WAIT_MS`, se devuelve el último payload observado.
+- Cada entry guarda `capture_ms`: cuánto tardó la captura hasta resolverse. Es la prueba de si una página sin identidad esperó de verdad el máximo (~8000 ms, cascarón persistente) o se resolvió temprano. Sin ese campo, "cascarón" y "captura prematura" se ven iguales en el export.
+- El snapshot de Adobe es el **más rico** visto durante la espera, no el último: `s` suele estar completo cerca del beacon y quedar vacío después, así que leerlo al final (cuando el DD ya llegó) perdería eVars que sí existían.
 - Un timeout de carga (25s) o una página de error de red (`chrome-error://`) se reportan como **error**, no como "sin digitalData": antes la auditoría culpaba al sitio por una página que la extensión nunca llegó a leer.
+- Cada entry guarda `http_status`, el código de la respuesta del `main_frame` final (permiso `webRequest`, solo lectura). Es lo que distingue tres casos que antes se veían iguales —página sin DD, IP bloqueada, URL muerta—:
+  - **403/429** → `edge-blocked` (env): el borde no sirvió la página (regla de bot o rate limit). No es un defecto del sitio, y es la señal de que hay que bajar el ritmo.
+  - **5xx** → `server-error` (env); **404/410** → `not-found` (env): el DD no llegó a existir porque la página no era la página.
+  - Sin `http_status` (corridas viejas), un título de denegación (`Access Denied`, `Web Page Blocked`, …) alcanza para el mismo veredicto; nunca pisa un código real.
 - Paridad entre ramas: corre el mismo set en ambas, descarga el DD de cada una y compara con `npm run parity -- base-dd.json perf-dd.json` (exit 0 = paridad, 1 = divergencia). Adoptar perf solo con paridad total.
+
+## Diagnóstico de problemas (derivado, no capturado)
+Cada entry guarda la evidencia cruda; el veredicto se **calcula al mostrarla**. No
+se escribe en `ddR:<n>`: si cambian las reglas, la misma corrida se vuelve a
+diagnosticar sin crawlear el sitio otra vez.
+
+- La página de resultados agrega chips por tarjeta con el código de cada problema
+  y un botón **Descargar problemas** con `{ generatedAt, summary, results }`.
+- `lib/diagnose.js` es puro y corre igual en el navegador y en node. El CLI
+  diagnostica un export ya descargado:
+
+  ```bash
+  npm run diagnose -- digitalData-resultados-123.json --out problemas.json
+  ```
+
+  El CLI valida el contrato del export combinado y **rechaza las vistas DD/AA
+  separadas** (exit 2): no traen `adobeAnalytics`, así que diagnosticarlas marcaba
+  todas las páginas como `dd-without-aa` cuando en realidad AA nunca se midió.
+
+- Para verificar que una corrida nueva reproduce las mismas reglas, compará su
+  export contra un baseline del mismo alcance:
+
+  ```bash
+  npm run compare-diagnosis -- baseline-problemas.json nueva-problemas.json
+  ```
+
+  Sale 0 si el veredicto de cada entry es idéntico, 1 si algo se movió (nombra los
+  índices y los deltas por código) y 2 si el alcance no coincide. Un diff no es
+  automáticamente una regresión: puede ser que el sitio cambió entre corridas; el
+  índice es el punto de partida para distinguirlo.
+
+- Cada problema lleva `code`, `severity` (high/medium/low) y `attribution`:
+  - `site` → la página no informa el dato; es lo que se convierte en AJUSTES.
+  - `tool` → la auditoría no pudo producir evidencia confiable (truncado).
+  - `env` → respuesta del entorno (redirect, preview, página que no cargó).
+- `siteSeverity` es la peor severidad **solo de problemas `site`**: un `load-error`
+  no debe mandar una URL a AJUSTES.
+
+| Código | Sev | Attr | Qué prueba |
+|---|---|---|---|
+| `dd-missing` | high | site | No hay DD, ni snapshot AA, ni beacon Adobe en una página que respondió 200 |
+| `missing-required` | high | site | Falta un campo del contrato (`DEFAULT_REQUIRED_FIELDS`) |
+| `dd-truncated` | high | tool | El entry tocó el tope de 256 KB |
+| `dd-unreadable` | high | tool | `digitalData` quedó como texto crudo: no se pueden leer campos |
+| `edge-blocked` | high | env | HTTP 403/429 (o página de denegación): el borde no sirvió la página |
+| `server-error` | high | env | HTTP 5xx: el servidor falló antes de cualquier data layer |
+| `load-error` | high | env | La página no cargó: no es veredicto sobre el sitio |
+| `pageName-mismatch` | medium | site | `page.pageName` no menciona el slug (opt-in: `checkPageName`) |
+| `aa-without-dd` | medium | site | Hay AA (o un beacon) y no hay DD; con beacon, el snapshot de `s` no era legible |
+| `dd-without-aa` | medium | site | Hay DD y AA no se midió |
+| `locale-mismatch` | medium | site | `metrics_locale` no corresponde al país del host |
+| `auth-wall` | medium | env | Redirigió a un IdP: la página pedida nunca se vio |
+| `not-found` | medium | env | HTTP 404/410: la URL ya no existe en ese entorno |
+| `invalid-status` | medium | tool | Estado fuera del enum del contrato |
+| `incomplete-entry` | medium | tool | El entry no trae `adobeAnalytics`: AA nunca se midió |
+| `redirect` | low | env | El DD pertenece a `finalUrl`, no a la URL pedida |
+| `template-old` | low | site | Señal, no veredicto (opt-in: `checkTemplate`) |
+| `adl-truncated` | low | tool | Solo se guardaron los primeros 50 eventos |
+| `preview-env` | low/medium | env | Host de preview; `medium` si no se pudo verificar |
+| `pending` | low | tool | La URL quedó en cola y nunca se procesó |
+
+Ningún veredicto `site` se deriva de evidencia incompleta: un entry truncado, una
+URL pendiente, un estado inválido, un payload ilegible o un export sin AA producen
+solo problemas `tool`. Antes cada uno de esos casos se reportaba como defecto del
+sitio de severidad alta.
+
+Los campos obligatorios son datos, no código: se pueden cambiar por plantilla con
+`diagnoseEntry(entry, { requiredFields: [...] })` cuando el cliente fije el
+contrato real.
+
+### Calibración con una corrida real (155 URLs Ford/Lincoln MX)
+
+Las reglas se midieron contra un export real antes de darlas por buenas. Tres
+supuestos no sobrevivieron:
+
+- `page.pageInfo.pageType` y `page.category.primaryCategory` existen en **0/137**
+  páginas: esta implementación usa `page.descriptor`, `page.tool`,
+  `page.hierarchy`. El default quedó en `page.pageName` (90%), el único campo
+  del contrato que el sitio realmente publica.
+- `pageName-mismatch` disparaba en **103/137** páginas sanas porque el cliente
+  nombra semánticamente (`service:home`, `ford owners:benefits`). Ahora es
+  opt-in y solo aplica cuando `pageName` replica la ruta.
+- `template-old` disparaba en **154/155** mientras 134/155 mandaban beacon de AA:
+  el loader lo inyecta el tag manager, así que la señal es el piso, no un hallazgo.
+  También opt-in.
+
+La regla que sí se agregó con evidencia: `auth-wall` (2 portales de propietario
+redirigen a `login.<marca>`; culpar al sitio por un DD que nunca se pudo ver es
+un falso positivo) y `preview-env` en `medium` cuando el host de preview no
+entregó datos (VPN).
+
+### Alcance de la lista, no de las reglas
+
+Las URLs `/overlay/*` son fragmentos modales que se inyectan en otra página: no
+tienen `digitalData` propio por diseño. No se excluyen con una regla (sería una
+decisión de alcance escondida en el código, imposible de auditar): se sacan de la
+lista de entrada. La corrida cruda queda intacta como evidencia y el diagnóstico
+se puede recalcular sobre ese crudo en cualquier momento.
 
 ## Validación A/B (antes de adoptar perf)
 Adoptar la rama `perf/*` sin medirla es fe. El procedimiento:
@@ -108,12 +214,13 @@ memoria. Ahora:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 87 tests (urls, formato, resultados, quota, estado de carga,
-  contrato de export, reglas y CLI del comparador de resúmenes, y un arnés de
-  integración de `background.js` con la API de Chrome simulada: layout por URL,
-  reanudación, aborto por cuota, página de error, cancelación con y sin worker
-  vivo, watchdog al despertar y al reiniciar una cola muda, reintento transitorio
-  y extractor de `digitalData`).
+- `npm test` — 184 tests (urls, formato, resultados, quota, estado de carga,
+  contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
+  reglas y CLI del comparador de resúmenes, y un arnés de integración de
+  `background.js` con la API de Chrome simulada: layout por URL, reanudación,
+  aborto por cuota, página de error, cancelación con y sin worker vivo, watchdog
+  al despertar y al reiniciar una cola muda, reintento transitorio y extractor de
+  `digitalData`).
 - `node --test --experimental-test-coverage test/` — cobertura de `lib/` entre
   89% y 100% por archivo (`lib/schema.js` es el más bajo: ramas de violación), y
   `tools/compare-summaries.js` en ~99% (reglas y CLI probadas).
