@@ -97,6 +97,9 @@
   .chip.fmc { border-color: #0ea5e9; color: #bae6fd; }
   .chip.aa { border-color: #8b5cf6; color: #ddd6fe; }
   .chip.links { border-color: #4b5563; }
+  .chip.sev-high { border-color: #dc2626; color: #fca5a5; }
+  .chip.sev-medium { border-color: #f59e0b; color: #fcd34d; }
+  .chip.sev-low { border-color: #64748b; color: #cbd5e1; }
   .toolbar {
     display: flex;
     gap: 10px;
@@ -169,6 +172,7 @@
     <button id="downloadDD" class="secondary">Descargar DD</button>
     <button id="downloadAA" class="secondary">Descargar AA</button>
     <button id="downloadSummary" class="secondary">Descargar resumen</button>
+    <button id="downloadDiagnosis" class="secondary">Descargar problemas</button>
     <button id="copyJson" class="secondary">Copiar al portapapeles</button>
     <button id="refresh" class="secondary">Actualizar</button>
   </div>
@@ -185,6 +189,7 @@
   <script src="lib/format.js"></script>
   <script src="lib/urls.js"></script>
   <script src="lib/results.js"></script>
+  <script src="lib/diagnose.js"></script>
   <script src="results.js"></script>
 </body>
 </html>
