@@ -219,7 +219,7 @@ hizo la corrida no producía ese campo" se ven idénticos, y esa ambigüedad ya
 costó una corrida.
 
 - `manifest.json` es la versión de la extensión y se sube con **cada cambio de
-  comportamiento** (hoy `1.1.0`). El export de resumen y el de problemas llevan
+  comportamiento** (hoy `1.1.2`). El export de resumen y el de problemas llevan
   `extensionVersion`: si un export nuevo no lo trae, la recarga no tomó.
 - El export de problemas lleva además `rulesVersion` (constante `RULES_VERSION`
   en `lib/diagnose.js`). Se sube cuando una regla cambia el significado de un
@@ -234,9 +234,38 @@ costó una corrida.
   con importadores externos), así que la versión viaja en los sobres: resumen y
   problemas.
 
+## Completitud: el reporte declara lo que no midió
+
+Un reporte de 148 entradas sobre una lista de 149 es un reporte equivocado, no
+uno más chico. Y el modo de perder una URL es silencioso: al cancelar, los
+workers devuelven **sin** persistir las capturas en vuelo, así que quedan huecos
+en el medio del índice mientras el resto de la cola ya terminó. El export
+contaba sólo lo capturado y se veía completo.
+
+Por eso el sobre de problemas y el de resumen llevan `completeness`:
+
+```json
+{ "expectedTotal": 149, "captured": 148, "notCaptured": 1,
+  "missing": [{ "index": 68, "url": "https://…” }],
+  "cancelled": false, "basis": "queue", "complete": false }
+```
+
+- `basis: "queue"` sabe el total porque tiene la cola guardada (`ddJob.urls`) y
+  puede **nombrar** la URL que no corrió. `basis: "indices"` (CLI sobre el
+  export combinado) sólo prueba que no hay huecos dentro del rango capturado: una
+  cola que nunca arrancó es invisible desde ahí, y el sobre lo dice en vez de
+  fingir certeza.
+- `cancelled` sale del marcador de la corrida: una corrida cancelada no es
+  completa aunque no falte ningún índice.
+- La CLI avisa por stderr (`WARNING: capture is incomplete…`), el comparador
+  imprime `[info] base capture is incomplete…` antes del veredicto, y la página
+  de resultados muestra una fila `Medición`.
+- El export combinado y las vistas DD/AA siguen siendo arrays planos: la
+  completitud viaja en los sobres, igual que la versión.
+
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 186 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 196 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,

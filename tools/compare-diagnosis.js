@@ -41,8 +41,27 @@ function describeRulesVersion(base, candidate) {
   return `[info] different ruleset: base ${label(left)}, candidate ${label(right)} — a diff is expected, not a site change`;
 }
 
-function formatReport(result) {
-  const lines = [];
+// A comparison over a run that dropped a URL is not like-for-like: the missing
+// index surfaces as "only in one side" and reads like a page that changed. Say
+// which side was short before showing the diff.
+function describeCompleteness(base, candidate) {
+  const rows = [];
+  [['base', base], ['candidate', candidate]].forEach(([label, data]) => {
+    if (!data || Array.isArray(data)) return;
+    const c = data.completeness;
+    if (!c || c.complete) return;
+    const ids = (Array.isArray(c.missing) ? c.missing : [])
+      .map((m) => `#${m.index}${m.url ? ` ${m.url}` : ''}`)
+      .join(', ');
+    rows.push(
+      `[info] ${label} capture is incomplete: ${c.captured}/${c.expectedTotal}` +
+      `${c.cancelled ? ' (cancelled)' : ''}${ids ? `; missing ${ids}` : ''}`
+    );
+  });
+  return rows;
+}
+
+function formatReport(result) {  const lines = [];
   result.findings.forEach((finding) => lines.push(`[${finding.level}] ${finding.message}`));
   if (result.deltas && Object.keys(result.deltas).length) {
     const deltas = Object.keys(result.deltas).map((code) => `${code} ${result.deltas[code] > 0 ? '+' : ''}${result.deltas[code]}`);
@@ -78,6 +97,7 @@ function main(argv) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     formatReport(result).forEach((line) => console.log(line));
+    describeCompleteness(baseData, candidateData).forEach((line) => console.log(line));
     const rulesLine = describeRulesVersion(baseData, candidateData);
     if (rulesLine) console.log(rulesLine);
     console.log(`Verdict: ${result.verdict} (${result.compared} entries compared)`);
@@ -91,4 +111,4 @@ if (require.main === module) {
   process.exitCode = main();
 }
 
-module.exports = { compareDiagnoses, parseArgs, formatReport, rulesVersionOf, describeRulesVersion, main };
+module.exports = { compareDiagnoses, parseArgs, formatReport, rulesVersionOf, describeRulesVersion, describeCompleteness, main };

@@ -151,4 +151,24 @@ describe('diagnose CLI', () => {
     assert.equal(missing.code, 2);
     assert.equal(quiet(() => main([])).code, 2);
   });
+
+  it('flags a capture with a hole instead of reporting it as a full audit', () => {
+    // Index 1 never produced a result: the tail survived, which is exactly how a
+    // cancelled run looks. The envelope must say so.
+    const holed = JSON.parse(JSON.stringify(sample));
+    holed[1].index = 2;
+    const input = tempFile('export.json', JSON.stringify(holed));
+    const out = path.join(input.dir, 'problemas.json');
+    try {
+      const { code, lines } = quiet(() => main([input.file, '--out', out]));
+      assert.equal(code, 0);
+      const report = JSON.parse(fs.readFileSync(out, 'utf8'));
+      assert.equal(report.completeness.complete, false);
+      assert.equal(report.completeness.basis, 'indices');
+      assert.deepEqual(report.completeness.missing.map((m) => m.index), [1]);
+      assert.ok(lines.some((line) => line.includes('WARNING: capture is incomplete')));
+    } finally {
+      fs.rmSync(input.dir, { recursive: true, force: true });
+    }
+  });
 });
