@@ -1156,29 +1156,15 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
       return safeKeys(value).length > 0;
     }
 
-    // Un digitalData con la estructura pero SIN identidad de página es un
-    // cascarón: el loader crea page.descriptor/tool primero y completa
-    // pageName/hierarchy después. Aceptar el cascarón captura la página a medio
-    // inicializar, y medido en producción eso NO es distinguible de un defecto:
-    // la misma URL devolvió el page block completo en una corrida y el cascarón
-    // en la siguiente, con Adobe Analytics ya sabiendo el pageName. Se espera la
-    // identidad hasta maxWaitMs; si nunca llega, se devuelve el último payload.
-    function hasIdentity(value) {
-      if (!value || typeof value !== 'object') return false;
-      const page = value.page;
-      if (!page || typeof page !== 'object' || safeIsArray(page)) return false;
-      const flat = ['pageName', 'siteSection', 'hierarchy', 'pageType', 'pageDomain'];
-      for (let i = 0; i < flat.length; i++) {
-        const field = page[flat[i]];
-        if (typeof field === 'string' && field.trim() !== '') return true;
-      }
-      const info = page.pageInfo;
-      if (info && typeof info === 'object' && !safeIsArray(info) &&
-          typeof info.pageName === 'string' && info.pageName.trim() !== '') return true;
-      const category = page.category;
-      return !!(category && typeof category === 'object' &&
-        typeof category.primaryCategory === 'string' && category.primaryCategory.trim() !== '');
-    }
+    // NO se espera la identidad de página (pageName/hierarchy/siteSection).
+    // La hipótesis de que el cascarón se completa después resultó falsa en
+    // producción: en 28 cargas medidas (dos corridas de 14 URLs con la espera
+    // activa) la identidad no apareció ni una vez, y en cuatro corridas de esas
+    // URLs apareció una sola vez — ya presente antes del primer poll, que es
+    // justo lo que atrapa el camino rápido. Esperar costaba ~7s por página sin
+    // capturar nada, así que se acepta el payload poblado y estable. capture_ms
+    // documenta cuánto se esperó y el diagnóstico reporta el cascarón como lo
+    // que es: un dato del sitio, no una medición nuestra.
 
     let lastSignature = null;
     let stableCount = 0;
@@ -1187,8 +1173,8 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
     let bestAAScore = -1;
 
     // Adobe's `s` is richest around the beacon and can be cleared afterwards, so
-    // a late read (we now wait for the DD identity) can see LESS than an early
-    // one. Keep the richest snapshot instead of the last one.
+    // a late read can see LESS than an early one. Keep the richest snapshot
+    // instead of the last one.
     function noteAdobe() {
       const snapshot = collectAdobe();
       if (!snapshot) return;
@@ -1214,12 +1200,7 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
               const signature = safeStringify(clone);
               dd = clone;
               best = clone;
-              if (!hasIdentity(clone)) {
-                // Cascarón: seguimos esperando. Si nunca se completa, el timeout
-                // devuelve el último payload observado y el diagnóstico decide.
-                lastSignature = null;
-                stableCount = 0;
-              } else if (signature === lastSignature) {
+              if (signature === lastSignature) {
                 stableCount++;
               } else {
                 lastSignature = signature;
