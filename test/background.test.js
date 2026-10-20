@@ -133,6 +133,11 @@ function createWorker(options = {}) {
     AbortController
   };
   context.globalThis = context;
+  // The queue is paced for the real site; tests that do not assert pacing run at
+  // full speed. The orphan test opts back into the real gap.
+  context.DD_TEST_NAV_STAGGER_MS = Object.prototype.hasOwnProperty.call(options, 'navStaggerMs')
+    ? options.navStaggerMs
+    : 0;
   if (options.fetch) context.fetch = options.fetch;
   if (options.page) context.window = options.page;
   const vmContext = vm.createContext(context);
@@ -421,20 +426,30 @@ describe('watchdog', () => {
   });
 
   it('closes the tabs the killed worker left behind', async () => {
-    const worker = createWorker();
+    const worker = createWorker({ navStaggerMs: 800 });
     await worker.send({ type: 'START_JOB', urls: URLS });
-    // Give the workers a beat to open their tabs and persist the live ids.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const progress = worker.snapshot().ddProgress;
-    assert.equal(progress.tabIds.length, URLS.length, 'live tab ids must be persisted');
+    // Navigations are paced (NAV_STAGGER_MS), so tabs no longer exist all at
+    // once: wait for at least one live tab instead of assuming a burst.
+    const deadline = Date.now() + 5000;
+    let progress = worker.snapshot().ddProgress;
+    while (!progress.tabIds.length && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      progress = worker.snapshot().ddProgress;
+    }
+    assert.ok(progress.tabIds.length > 0, 'live tab ids must be persisted');
+    assert.ok(progress.tabIds.length <= 3, 'never more live tabs than CONCURRENCY');
 
     worker.evaluate('activeJob.handle.cancelled = true; activeJob.handle.superseded = true; activeJob = null;');
     await worker.fireAlarm();
     await worker.waitForJobEnd();
 
-    // Every tab opened by the first queue is closed: 5 orphans + 5 from the
-    // restarted queue.
-    URLS.forEach((_, i) => assert.ok(worker.tabs.removed.includes(i + 1), `tab ${i + 1} must be closed`));
+    // No orphan survives the restart, and every tab opened by the first queue
+    // was closed either by its own worker or by the watchdog. The results tab
+    // (chrome-extension://) is not a page load and stays open by design.
+    worker.tabs.created.forEach((id) => {
+      assert.ok(!worker.tabs.live.has(id), `tab ${id} must not stay open`);
+      assert.ok(worker.tabs.removed.includes(id), `tab ${id} must be closed`);
+    });
   });
 
   it('clears the alarm when the alarm finds no running job', async () => {
@@ -490,6 +505,50 @@ describe('extractPageAnalytics', () => {
     const worker = createWorker({ page });
     const result = await worker.sandbox.extractPageAnalytics(300, 10, 2);
     assert.equal(result.dd.page.pageInfo.pageName, 'stable');
+  });
+
+  it('waits past a populated shell until the page identity arrives', async () => {
+    // Ford's loader fills page.descriptor/tool first and pageName later. The shell
+    // is "populated" and stable, so accepting it captures a page that is still
+    // initializing (measured: same URL, full block in one run and shell in the next).
+    const shell = { page: { descriptor: 'none', tool: 'none', userLanguage: '' } };
+    const page = { digitalData: shell };
+    const worker = createWorker({ page });
+    setTimeout(() => {
+      page.digitalData = { page: { pageName: 'fmx:owner:recalls:landing', hierarchy: 'owners:fmx:recalls' } };
+    }, 30);
+
+    const result = await worker.sandbox.extractPageAnalytics(400, 10, 2);
+    assert.equal(result.dd.page.pageName, 'fmx:owner:recalls:landing');
+  });
+
+  it('returns the shell when the identity never arrives', async () => {
+    const shell = { page: { descriptor: 'none', tool: 'none' } };
+    const worker = createWorker({ page: { digitalData: shell } });
+    const result = await worker.sandbox.extractPageAnalytics(80, 10, 2);
+    assert.equal(result.dd.page.descriptor, 'none');
+    assert.equal(result.dd.page.pageName, undefined);
+  });
+
+  it('reports how long the capture took', async () => {
+    const worker = createWorker({ page: { digitalData: { page: { pageName: 'p' } } } });
+    const result = await worker.sandbox.extractPageAnalytics(300, 10, 2);
+    assert.ok(Number.isFinite(result.captureMs));
+    assert.ok(result.captureMs >= 0);
+  });
+
+  it('keeps the richest Adobe snapshot when the page clears it later', async () => {
+    // Waiting for the DD identity reads `s` later; AppMeasurement can be emptier
+    // by then, so the early snapshot must win.
+    const page = {
+      digitalData: { page: { descriptor: 'none', tool: 'none' } },
+      s: { pageName: 'recalls', eVar1: 'kept' }
+    };
+    const worker = createWorker({ page });
+    setTimeout(() => { page.s = { pageName: 'recalls' }; }, 30);
+
+    const result = await worker.sandbox.extractPageAnalytics(150, 10, 2);
+    assert.equal(result.aa.s.eVar1, 'kept');
   });
 
   it('falls back to the last seen payload when it never stabilizes', async () => {
