@@ -507,27 +507,23 @@ describe('extractPageAnalytics', () => {
     assert.equal(result.dd.page.pageInfo.pageName, 'stable');
   });
 
-  it('waits past a populated shell until the page identity arrives', async () => {
-    // Ford's loader fills page.descriptor/tool first and pageName later. The shell
-    // is "populated" and stable, so accepting it captures a page that is still
-    // initializing (measured: same URL, full block in one run and shell in the next).
+  it('accepts a populated shell instead of waiting for a page identity', async () => {
+    // Measured: on 28 page loads with the identity wait enabled, the identity
+    // never arrived; in four runs of the same 14 URLs it showed up once, already
+    // present before the first poll. Waiting cost ~7s per page and captured
+    // nothing, so a populated shell resolves as soon as it is stable. The shell
+    // is a finding about the site, not a reason to burn wall time.
     const shell = { page: { descriptor: 'none', tool: 'none', userLanguage: '' } };
     const page = { digitalData: shell };
     const worker = createWorker({ page });
     setTimeout(() => {
-      page.digitalData = { page: { pageName: 'fmx:owner:recalls:landing', hierarchy: 'owners:fmx:recalls' } };
+      page.digitalData = { page: { pageName: 'fmx:owner:recalls:landing' } };
     }, 30);
 
     const result = await worker.sandbox.extractPageAnalytics(400, 10, 2);
-    assert.equal(result.dd.page.pageName, 'fmx:owner:recalls:landing');
-  });
-
-  it('returns the shell when the identity never arrives', async () => {
-    const shell = { page: { descriptor: 'none', tool: 'none' } };
-    const worker = createWorker({ page: { digitalData: shell } });
-    const result = await worker.sandbox.extractPageAnalytics(80, 10, 2);
-    assert.equal(result.dd.page.descriptor, 'none');
+    assert.equal(result.dd.page.descriptor, 'none', 'the shell is the answer');
     assert.equal(result.dd.page.pageName, undefined);
+    assert.ok(result.captureMs < 400, 'it must not sit on the timeout');
   });
 
   it('reports how long the capture took', async () => {
