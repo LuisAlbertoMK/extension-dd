@@ -39,6 +39,13 @@ describe('export contract', () => {
     assert.deepEqual(EXPORT_STATUS, ['ok', 'no-data', 'error', 'pending']);
   });
 
+  it('accepts the additive capture fields when typed, rejects them when not', () => {
+    const [okEntry] = buildCombinedJson(sampleResults());
+    assert.deepEqual(validateExport([{ ...okEntry, http_status: 403, capture_ms: 8001 }]), []);
+    assert.ok(validateExport([{ ...okEntry, http_status: '403' }]).some((v) => v.includes('.http_status')));
+    assert.ok(validateExport([{ ...okEntry, capture_ms: 'slow' }]).some((v) => v.includes('.capture_ms')));
+  });
+
   it('rejects missing fields, bad enums and out-of-order items', () => {
     const [okEntry, ...rest] = buildCombinedJson(sampleResults());
     const { index, ...withoutIndex } = okEntry;

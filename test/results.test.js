@@ -130,6 +130,24 @@ describe('buildCombinedJson', () => {
     assert.equal(out[1].has_fmc_context, true);
     assert.equal(out[1].has_aa_beacon, false);
   });
+
+  it('exports capture_ms and http_status so a shell can be told apart from a block', () => {
+    const out = buildCombinedJson({
+      '0__https://x.example/': {
+        url: 'https://x.example/',
+        status: 'ok',
+        digitalData: { page: { tool: 'none' } },
+        error: null,
+        capture_ms: 8001,
+        http_status: 403
+      },
+      '1__https://x.example/a': { url: 'https://x.example/a', status: 'ok', digitalData: {}, error: null }
+    });
+    assert.equal(out[0].capture_ms, 8001);
+    assert.equal(out[0].http_status, 403);
+    assert.ok(!('capture_ms' in out[1]), 'older entries keep the original shape');
+    assert.ok(!('http_status' in out[1]));
+  });
 });
 
 describe('buildDDJson / buildAAJson', () => {

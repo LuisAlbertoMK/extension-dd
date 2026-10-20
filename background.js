@@ -15,7 +15,15 @@ const DIGITALDATA_STABLE_POLLS = 2;
 const CLOSE_TABS_AFTER_READ = true;
 // Cuántas URLs se procesan en paralelo. Con listas largas (decenas/cientos),
 // mantenerlo bajo evita saturar Chrome (memoria/CPU) y que el sitio te bloquee.
-const CONCURRENCY = 5;
+// Ford/Akamai: una ráfaga de pestañas desde una sola IP se parece a un crawler.
+// 3 en paralelo + NAV_STAGGER_MS deja ~1 navegación por segundo.
+const CONCURRENCY = 3;
+// Separación mínima entre el inicio de dos navegaciones (más jitter). Sin esto,
+// los workers arrancan a la vez y el borde ve un burst, no una visita humana.
+// La suite de integración la baja a 0 por contexto (DD_TEST_NAV_STAGGER_MS).
+const NAV_STAGGER_MS = Number.isFinite(globalThis.DD_TEST_NAV_STAGGER_MS)
+  ? globalThis.DD_TEST_NAV_STAGGER_MS
+  : 800;
 // Global per-URL timeout while waiting for a tab to report "complete".
 const TAB_LOAD_TIMEOUT_MS = 25000;
 // Per-entry cap so a single huge digitalData payload cannot blow the storage quota.
@@ -125,6 +133,29 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.runtime.onInstalled.addListener(() => {
   ensureFordRequestRules().catch(() => {});
 });
+
+// ---- HTTP status of the final main-frame response ----
+
+// The status code is the only way to tell "this page has no data layer" from "the
+// edge refused to serve it" (403/429) or "the URL is dead" (404/410). webRequest is
+// read-only here: it never blocks anything.
+const HTTP_STATUS_BY_TAB = new Map();
+
+if (chrome.webRequest && chrome.webRequest.onCompleted) {
+  try {
+    chrome.webRequest.onCompleted.addListener(
+      (details) => {
+        if (details && details.tabId >= 0 && details.type === 'main_frame') {
+          HTTP_STATUS_BY_TAB.set(details.tabId, details.statusCode);
+        }
+      },
+      { urls: ['<all_urls>'], types: ['main_frame'] }
+    );
+  } catch (e) {
+    // The status is optional evidence: a registration failure must never stop
+    // the worker from capturing the data layer.
+  }
+}
 
 // ---- Ford AEM bypass (headers + cookie) ----
 
@@ -528,6 +559,17 @@ async function watchdogTick() {
 
 // ---- Queue ----
 
+// Start gate: every navigation waits its turn plus a random gap, so N workers
+// never fire together. Serialized through a promise chain on purpose: a burst of
+// tabs from one IP is exactly what a bot rule scores.
+let navGate = Promise.resolve();
+
+function paceNavigation() {
+  const jitter = NAV_STAGGER_MS ? Math.floor(Math.random() * 400) : 0;
+  navGate = navGate.then(() => sleep(NAV_STAGGER_MS + jitter));
+  return navGate;
+}
+
 async function runQueue(job) {
   const { record, handle } = job;
   await ensurePerfRules(true).catch(() => {});
@@ -564,6 +606,8 @@ async function runQueue(job) {
 
       inflight++;
       try {
+        await paceNavigation();
+        if (handle.cancelled) return;
         const outcome = await processUrl(record.urls[idx], idx, job);
         // A cancelled job must never write again: its progress payload is stale,
         // and a watchdog restart would let it overwrite the newer queue's counters.
@@ -736,7 +780,9 @@ async function attemptUrl(url, idx, job) {
     title: null,
     links_found: 0,
     has_fmc_context: null,
-    has_aa_beacon: null
+    has_aa_beacon: null,
+    // HTTP status of the final main-frame response (403/429 = edge block).
+    http_status: null
   };
   let tab;
   let retryable = false;
@@ -759,6 +805,10 @@ async function attemptUrl(url, idx, job) {
         pageUrl = current.url;
       }
     } catch (e) { /* tab already gone */ }
+
+    // Status of the response the tab actually rendered (not of a redirect hop).
+    // Absent when webRequest missed it: an old status is better than a guess.
+    if (HTTP_STATUS_BY_TAB.has(tab.id)) entry.http_status = HTTP_STATUS_BY_TAB.get(tab.id);
 
     // A closed tab or a network error page carries no data layer: say so
     // instead of reporting "sin digitalData" for a page that never loaded.
@@ -793,6 +843,9 @@ async function attemptUrl(url, idx, job) {
     } else {
       const dd = payload.dd !== undefined ? payload.dd : null;
       const aa = payload.aa !== undefined ? payload.aa : null;
+      // Observability for a capture that has to wait: a shell that resolves at
+      // ~8s is a page that never populated its identity, not a lucky early read.
+      if (Number.isFinite(payload.captureMs)) entry.capture_ms = Math.round(payload.captureMs);
       const hasAA = !!(aa && (aa.s || aa.satellite || aa.dataLayer));
       if (!dd && !hasAA) {
         const result = noDataResult(loadOutcome);
@@ -813,6 +866,7 @@ async function attemptUrl(url, idx, job) {
   } finally {
     if (tab) {
       untrackTab(job, tab.id);
+      HTTP_STATUS_BY_TAB.delete(tab.id);
       if (CLOSE_TABS_AFTER_READ) {
         try { await chrome.tabs.remove(tab.id); } catch (e) { /* ignore */ }
       }
@@ -1102,11 +1156,51 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
       return safeKeys(value).length > 0;
     }
 
+    // Un digitalData con la estructura pero SIN identidad de página es un
+    // cascarón: el loader crea page.descriptor/tool primero y completa
+    // pageName/hierarchy después. Aceptar el cascarón captura la página a medio
+    // inicializar, y medido en producción eso NO es distinguible de un defecto:
+    // la misma URL devolvió el page block completo en una corrida y el cascarón
+    // en la siguiente, con Adobe Analytics ya sabiendo el pageName. Se espera la
+    // identidad hasta maxWaitMs; si nunca llega, se devuelve el último payload.
+    function hasIdentity(value) {
+      if (!value || typeof value !== 'object') return false;
+      const page = value.page;
+      if (!page || typeof page !== 'object' || safeIsArray(page)) return false;
+      const flat = ['pageName', 'siteSection', 'hierarchy', 'pageType', 'pageDomain'];
+      for (let i = 0; i < flat.length; i++) {
+        const field = page[flat[i]];
+        if (typeof field === 'string' && field.trim() !== '') return true;
+      }
+      const info = page.pageInfo;
+      if (info && typeof info === 'object' && !safeIsArray(info) &&
+          typeof info.pageName === 'string' && info.pageName.trim() !== '') return true;
+      const category = page.category;
+      return !!(category && typeof category === 'object' &&
+        typeof category.primaryCategory === 'string' && category.primaryCategory.trim() !== '');
+    }
+
     let lastSignature = null;
     let stableCount = 0;
     let best = null;
+    let bestAA = null;
+    let bestAAScore = -1;
+
+    // Adobe's `s` is richest around the beacon and can be cleared afterwards, so
+    // a late read (we now wait for the DD identity) can see LESS than an early
+    // one. Keep the richest snapshot instead of the last one.
+    function noteAdobe() {
+      const snapshot = collectAdobe();
+      if (!snapshot) return;
+      const score = snapshot.s ? safeKeys(snapshot.s).length : 0;
+      if (score > bestAAScore) {
+        bestAA = snapshot;
+        bestAAScore = score;
+      }
+    }
 
     function check() {
+      noteAdobe();
       const foundName = candidateNames.find((name) => typeof window[name] !== 'undefined');
       let dd = null;
       if (foundName) {
@@ -1120,7 +1214,12 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
               const signature = safeStringify(clone);
               dd = clone;
               best = clone;
-              if (signature === lastSignature) {
+              if (!hasIdentity(clone)) {
+                // Cascarón: seguimos esperando. Si nunca se completa, el timeout
+                // devuelve el último payload observado y el diagnóstico decide.
+                lastSignature = null;
+                stableCount = 0;
+              } else if (signature === lastSignature) {
                 stableCount++;
               } else {
                 lastSignature = signature;
@@ -1133,11 +1232,11 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
         }
       }
       if (dd && stableCount >= requiredPolls) {
-        resolve({ dd: dd, aa: collectAdobe(), page: collectPage() });
+        resolve({ dd: dd, aa: bestAA || collectAdobe(), page: collectPage(), captureMs: safeNow() - start });
       } else if (safeNow() - start > maxWaitMs) {
         // Nunca se estabilizó: devolvemos lo último visto (o null) en vez de
         // inventar un OK con el primer valor parcial.
-        resolve({ dd: best, aa: collectAdobe(), page: collectPage() });
+        resolve({ dd: best, aa: bestAA || collectAdobe(), page: collectPage(), captureMs: safeNow() - start });
       } else {
         setTimeout(check, intervalMs);
       }
