@@ -8,7 +8,7 @@
 // Exit codes: 0 ok, 2 invalid input.
 const fs = require('fs');
 const path = require('path');
-const { diagnoseEntries, summarizeDiagnosis } = require('../lib/diagnose.js');
+const { diagnoseEntries, summarizeDiagnosis, RULES_VERSION } = require('../lib/diagnose.js');
 const { validateExport } = require('../lib/schema.js');
 const { isPreviewUrl } = require('../lib/urls.js');
 
@@ -71,6 +71,9 @@ function main(argv) {
   const results = diagnoseEntries(parsed, { isPreviewUrl });
   const report = {
     generatedAt: new Date().toISOString(),
+    // Which rules produced these verdicts. Without it, comparing this file
+    // against a baseline taken under older rules looks like the site changed.
+    rulesVersion: RULES_VERSION,
     summary: summarizeDiagnosis(results),
     results
   };

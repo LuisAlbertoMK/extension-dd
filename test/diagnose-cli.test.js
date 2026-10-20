@@ -99,7 +99,11 @@ describe('diagnose CLI', () => {
     try {
       const { code } = quiet(() => main([input.file]));
       assert.equal(code, 0);
-      assert.equal(JSON.parse(captured).summary.total, 2);
+      const report = JSON.parse(captured);
+      assert.equal(report.summary.total, 2);
+      // Provenance: a baseline without it cannot be compared as if it were
+      // produced by the same rules.
+      assert.equal(typeof report.rulesVersion, 'number');
     } finally {
       process.stdout.write = original;
       fs.rmSync(input.dir, { recursive: true, force: true });

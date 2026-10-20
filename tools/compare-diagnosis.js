@@ -24,6 +24,23 @@ function readExport(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
 }
 
+function rulesVersionOf(data) {
+  if (!data || Array.isArray(data) || !Object.prototype.hasOwnProperty.call(data, 'rulesVersion')) return null;
+  return data.rulesVersion;
+}
+
+// Determinism only holds inside one ruleset. Saying which side ran which rules
+// turns "the verdicts moved" into either "expected, the rules changed" or
+// "unexpected, the site or the capture did".
+function describeRulesVersion(base, candidate) {
+  const left = rulesVersionOf(base);
+  const right = rulesVersionOf(candidate);
+  if (left == null && right == null) return null;
+  const label = (value) => (value == null ? 'unknown' : `v${value}`);
+  if (left === right) return `Rules: ${label(left)} on both sides`;
+  return `[info] different ruleset: base ${label(left)}, candidate ${label(right)} — a diff is expected, not a site change`;
+}
+
 function formatReport(result) {
   const lines = [];
   result.findings.forEach((finding) => lines.push(`[${finding.level}] ${finding.message}`));
@@ -46,8 +63,12 @@ function main(argv) {
     return 2;
   }
   let result;
+  let baseData;
+  let candidateData;
   try {
-    result = compareDiagnoses(readExport(args.base), readExport(args.candidate));
+    baseData = readExport(args.base);
+    candidateData = readExport(args.candidate);
+    result = compareDiagnoses(baseData, candidateData);
   } catch (error) {
     console.error(`Cannot read exports: ${error.message}`);
     return 2;
@@ -57,6 +78,8 @@ function main(argv) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     formatReport(result).forEach((line) => console.log(line));
+    const rulesLine = describeRulesVersion(baseData, candidateData);
+    if (rulesLine) console.log(rulesLine);
     console.log(`Verdict: ${result.verdict} (${result.compared} entries compared)`);
   }
 
@@ -68,4 +91,4 @@ if (require.main === module) {
   process.exitCode = main();
 }
 
-module.exports = { compareDiagnoses, parseArgs, formatReport, main };
+module.exports = { compareDiagnoses, parseArgs, formatReport, rulesVersionOf, describeRulesVersion, main };
