@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node --test test/",
     "parity": "node tools/parity-check.js",
-    "compare": "node tools/compare-summaries.js"
+    "compare": "node tools/compare-summaries.js",
+    "diagnose": "node tools/diagnose.js"
   },
   "license": "UNLICENSED"
 }
