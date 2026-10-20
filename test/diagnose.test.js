@@ -95,6 +95,20 @@ describe('diagnoseEntry — evidence quality (no false site blame)', () => {
     assert.deepEqual(codes(gone), ['not-found']);
   });
 
+  it('does not blame a 404 page that still served a data-layer shell', () => {
+    // Measured: the three Lincoln /promociones/* URLs answer 404 with a shell
+    // that has page.descriptor/tool but no pageName. Reading that as a site
+    // defect is blaming a page that does not exist for not describing itself.
+    const diagnosis = diagnoseEntry(entry({
+      status: 'ok',
+      http_status: 404,
+      digitalData: { page: { descriptor: 'none', tool: 'none', userLanguage: '' } },
+      adobeAnalytics: { s: { pageName: 'lincoln:404' }, satellite: null, dataLayer: null }
+    }));
+    assert.equal(diagnosis.siteSeverity, 'none');
+    assert.deepEqual(codes(diagnosis), ['not-found']);
+  });
+
   it('still reports a real absence when the page answered 200', () => {
     const diagnosis = diagnoseEntry(noData({ http_status: 200 }));
     assert.equal(diagnosis.siteSeverity, 'high');
