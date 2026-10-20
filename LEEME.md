@@ -212,9 +212,31 @@ memoria. Ahora:
   (antes leía solo `ddJob`, que no se actualiza a mitad de corrida, así que las
   pestañas quedaban abiertas para siempre).
 
+## Versionado y procedencia
+
+Un export sin versión no se puede auditar: "el campo no está" y "el código que
+hizo la corrida no producía ese campo" se ven idénticos, y esa ambigüedad ya
+costó una corrida.
+
+- `manifest.json` es la versión de la extensión y se sube con **cada cambio de
+  comportamiento** (hoy `1.1.0`). El export de resumen y el de problemas llevan
+  `extensionVersion`: si un export nuevo no lo trae, la recarga no tomó.
+- El export de problemas lleva además `rulesVersion` (constante `RULES_VERSION`
+  en `lib/diagnose.js`). Se sube cuando una regla cambia el significado de un
+  veredicto: comparar contra un baseline de otra versión de reglas no mide al
+  sitio, mide el cambio de reglas.
+- `npm run compare-diagnosis` imprime el ruleset de cada lado:
+  `Rules: v1 on both sides` (determinismo dentro del mismo ruleset) o
+  `[info] different ruleset: base v0, candidate v1 — a diff is expected, not a
+  site change`. Un cambio de reglas **no** cambia el exit code: cambia cómo se
+  lee el diff, no si hay regresión.
+- El export combinado sigue siendo un array plano por contrato (compatibilidad
+  con importadores externos), así que la versión viaja en los sobres: resumen y
+  problemas.
+
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 184 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 186 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,

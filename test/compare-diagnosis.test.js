@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { compareDiagnoses } = require('../lib/diagnose.js');
-const { parseArgs, main } = require('../tools/compare-diagnosis.js');
+const { parseArgs, main, describeRulesVersion } = require('../tools/compare-diagnosis.js');
 
 function verdict(index, codes, extra) {
   return Object.assign({
@@ -108,6 +108,23 @@ describe('compareDiagnoses', () => {
 });
 
 describe('compare-diagnosis CLI', () => {
+  it('names the ruleset on both sides so a diff can be read correctly', () => {
+    assert.equal(describeRulesVersion({ rulesVersion: 3, results: [] }, { rulesVersion: 3, results: [] }), 'Rules: v3 on both sides');
+    const moved = describeRulesVersion({ rulesVersion: 2, results: [] }, { rulesVersion: 3, results: [] });
+    assert.ok(moved.includes('different ruleset'));
+    assert.ok(moved.includes('v2') && moved.includes('v3'));
+    assert.equal(describeRulesVersion({ results: [] }, { rulesVersion: 3, results: [] }).includes('unknown'), true);
+    assert.equal(describeRulesVersion([], []), null, 'bare arrays carry no version');
+  });
+
+  it('prints the ruleset line in the report', () => {
+    const base = tempFile('base.json', JSON.stringify({ rulesVersion: 1, results: [verdict(0)] }));
+    const candidate = tempFile('candidate.json', JSON.stringify({ rulesVersion: 2, results: [verdict(0)] }));
+    const run = quiet(() => main([base, candidate]));
+    assert.equal(run.code, 0, 'a ruleset change alone does not fail the comparison');
+    assert.ok(run.lines.some((line) => line.includes('different ruleset')));
+  });
+
   it('parses two paths and --json', () => {
     assert.deepEqual(parseArgs(['a.json', 'b.json', '--json']), {
       base: 'a.json',

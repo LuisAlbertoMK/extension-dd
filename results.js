@@ -41,6 +41,18 @@ const DIAG_OPTIONS = {
   isPreviewUrl: (url) => classifyEnv(url) === 'preview'
 };
 
+// Which build produced an export. Without it, an export that lacks a new field
+// cannot be told apart from a capture that simply did not produce it. The
+// manifest version is the identifier Chrome guarantees, so it is bumped with
+// every behavior change instead of being remembered by hand.
+function extensionVersion() {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch (e) {
+    return null;
+  }
+}
+
 // A diagnosis is derived from the stored entry, never persisted: rules can
 // change and the same run can be re-diagnosed without crawling again.
 // Cached per index: renderSummary runs on every storage write, and re-diagnosing
@@ -323,6 +335,7 @@ document.getElementById('downloadSummary').addEventListener('click', async () =>
   }, classifyEnv);
   summary.generatedAt = new Date().toISOString();
   summary.expectedTotal = raw.ddTotal || summary.total;
+  summary.extensionVersion = extensionVersion();
   const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -363,6 +376,8 @@ document.getElementById('downloadDiagnosis').addEventListener('click', async () 
   const diagnoses = diagnoseEntries(items, DIAG_OPTIONS);
   downloadFile(`digitalData-problemas-${Date.now()}.json`, {
     generatedAt: new Date().toISOString(),
+    extensionVersion: extensionVersion(),
+    rulesVersion: RULES_VERSION,
     summary: summarizeDiagnosis(diagnoses),
     results: diagnoses
   });
