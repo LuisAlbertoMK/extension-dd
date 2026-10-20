@@ -36,6 +36,29 @@ function classifyEnv(url) {
   }
 }
 
+// Diagnosis options live here because isPreviewUrl is a page global (lib/urls.js).
+const DIAG_OPTIONS = {
+  isPreviewUrl: (url) => classifyEnv(url) === 'preview'
+};
+
+// A diagnosis is derived from the stored entry, never persisted: rules can
+// change and the same run can be re-diagnosed without crawling again.
+// Cached per index: renderSummary runs on every storage write, and re-diagnosing
+// the whole list each time would be the O(n^2) trap the list rendering already has.
+const diagnosisCache = new Map();
+
+function diagnosisFor(idx, entry) {
+  const cached = diagnosisCache.get(idx);
+  if (cached) return cached;
+  const diagnosis = diagnoseEntry(Object.assign({}, entry, { index: idx }), DIAG_OPTIONS);
+  diagnosisCache.set(idx, diagnosis);
+  return diagnosis;
+}
+
+function currentDiagnosis() {
+  return summarizeDiagnosis(lastEntries.map(({ idx, entry }) => diagnosisFor(idx, entry)));
+}
+
 function badgeClass(status) {
   return status || 'pending';
 }
@@ -51,9 +74,10 @@ function statusLabel(status) {
 
 // entryIndex, orderedResults, buildCombinedJson and formatElapsed live in lib/.
 
-function buildCard(entry) {
+function buildCard(entry, idx) {
   const card = document.createElement('div');
   card.className = 'card';
+  const diagnosis = diagnosisFor(idx, entry);
 
   const header = document.createElement('div');
   header.className = 'card-header';
@@ -108,6 +132,12 @@ function buildCard(entry) {
   if (entry.has_fmc_context) chip('FMC.context', 'fmc');
   if (entry.has_aa_beacon) chip('Beacon AA', 'aa');
   if (entry.links_found) chip(entry.links_found + ' enlaces', 'links');
+  diagnosis.problems.slice(0, 4).forEach((problem) => {
+    chip(problem.code, 'sev-' + problem.severity);
+  });
+  if (diagnosis.problems.length > 4) {
+    chip(`+${diagnosis.problems.length - 4} más`, 'sev-' + diagnosis.severity);
+  }
   if (chips.childNodes.length) card.appendChild(chips);
   card.appendChild(pre);
   return card;
@@ -134,12 +164,13 @@ function renderSummary() {
   renderStats(buildSummary(lastEntries, {
     startedAt: meta.startedAt,
     finishedAt: meta.running ? Date.now() : meta.finishedAt
-  }, classifyEnv));
+  }, classifyEnv), currentDiagnosis());
 }
 
 function renderList(entries) {
   listEl.innerHTML = '';
   cardEls = new Map();
+  diagnosisCache.clear();
   if (!entries.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
@@ -148,7 +179,7 @@ function renderList(entries) {
     return;
   }
   entries.forEach(({ idx, entry }) => {
-    const card = buildCard(entry);
+    const card = buildCard(entry, idx);
     cardEls.set(idx, card);
     listEl.appendChild(card);
   });
@@ -168,7 +199,8 @@ function upsertResult(idx, entry) {
   entriesByIndex.set(idx, entry);
   lastEntries = orderedResults(Object.fromEntries(entriesByIndex));
 
-  const card = buildCard(entry);
+  diagnosisCache.delete(idx);
+  const card = buildCard(entry, idx);
   const existing = cardEls.get(idx);
   if (existing) {
     existing.replaceWith(card);
@@ -203,7 +235,7 @@ async function readStoredResults() {
 }
 
 // Renders the audit summary with textContent only (entries may carry untrusted strings).
-function renderStats(summary) {
+function renderStats(summary, diagnosis) {
   statsEl.innerHTML = '';
   function row(label, value) {
     const div = document.createElement('div');
@@ -230,6 +262,15 @@ function renderStats(summary) {
     `${summary.byTemplate.new} / ${summary.byTemplate.old}${summary.byTemplate.unknown ? ` (+${summary.byTemplate.unknown} sin dato)` : ''}`);
   row('Con FMC.context', `${summary.fmcContext.with} / ${summary.total}`);
   row('Con beacon Adobe', `${summary.aaBeacon.with} / ${summary.total}`);
+  if (diagnosis) {
+    row('Con problemas', `${diagnosis.withProblems} / ${diagnosis.total}`);
+    row('Problemas de sitio (alta/media/baja)',
+      `${diagnosis.bySiteSeverity.high} / ${diagnosis.bySiteSeverity.medium} / ${diagnosis.bySiteSeverity.low}`);
+    const topCode = Object.keys(diagnosis.byCode)
+      .map((code) => ({ code, count: diagnosis.byCode[code] }))
+      .sort((a, b) => b.count - a.count)[0];
+    if (topCode) row('Código más frecuente', `${topCode.code} ×${topCode.count}`);
+  }
   summary.topErrors.forEach((e) => row(`Top error ×${e.count}`, e.message));
   if (summary.byStatus.error > 0) {
     const btn = document.createElement('button');
@@ -314,6 +355,17 @@ document.getElementById('downloadDD').addEventListener('click', async () => {
 document.getElementById('downloadAA').addEventListener('click', async () => {
   const results = await readStoredResults();
   downloadFile(`digitalData-aa-${Date.now()}.json`, buildAAJson(results));
+});
+
+document.getElementById('downloadDiagnosis').addEventListener('click', async () => {
+  const results = await readStoredResults();
+  const items = orderedResults(results).map(({ idx, entry }) => Object.assign({}, entry, { index: idx }));
+  const diagnoses = diagnoseEntries(items, DIAG_OPTIONS);
+  downloadFile(`digitalData-problemas-${Date.now()}.json`, {
+    generatedAt: new Date().toISOString(),
+    summary: summarizeDiagnosis(diagnoses),
+    results: diagnoses
+  });
 });
 
 document.getElementById('copyJson').addEventListener('click', async () => {
