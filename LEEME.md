@@ -302,6 +302,39 @@ Por eso el sobre de problemas y el de resumen llevan `completeness`:
 - El export combinado y las vistas DD/AA siguen siendo arrays planos: la
   completitud viaja en los sobres, igual que la versión.
 
+## Contrato derivado de los datos
+
+Validar contra un contrato escrito a mano no escala: el proyecto hermano
+`ford-sitemap-detector` mantiene un CSV por página (12 filas para una sola URL,
+13 archivos para 13 páginas) y de sus 14 URLs sólo **una** aparece en una corrida
+de 149, así que esa validación no se puede ejercitar. Además su validador hace
+`page.get(propiedad.replace('page.', ''))`: sólo entiende hijos planos de `page`,
+y compara con igualdad estricta, así que no distingue una clave ausente de una
+vacía ni admite un valor que dependa de la URL.
+
+El contrato se genera al revés: agrupando las páginas que comparten
+`page.siteSection` y midiendo qué es invariante, qué sigue un prefijo y qué es
+varianza de plantilla.
+
+```bash
+node tools/contract.js build export.json --out contrato.json      # --by page.siteSection --min-sample 3 --min-coverage 0.95
+node tools/contract.js check export.json --contract contrato.json  # --out reporte.json --json
+```
+
+- **literal**: el campo se lleva en ≥95% del grupo con un único valor (`client`,
+  `site`, `radUIVersion`, `descriptor: "none"`).
+- **prefix**: campo de alta cardinalidad (`pageName`, `pageNameNoVehicle`,
+  `hierarchy`) donde todo el grupo comparte prefijo; se corta en el separador
+  (`help:` y no `help:pri`).
+- **varianza**: todo lo demás, y **no genera hallazgos**. La cobertura cuenta
+  valores efectivamente llevados, no claves presentes: un campo vacío en un 20%
+  del grupo es forma de la plantilla, no un defecto del 20%.
+
+Propiedad que lo hace confiable: **el contrato no produce hallazgos contra el
+export del que salió**. Eso se verifica en cada build y está pinneado en los tests.
+Los desvíos aparecen cuando se corre contra una captura nueva, que es justamente
+cuando importan.
+
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
 - `npm test` — 207 tests (urls, formato, resultados, quota, estado de carga,
