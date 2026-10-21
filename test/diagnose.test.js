@@ -135,6 +135,44 @@ describe('diagnoseEntry — evidence quality (no false site blame)', () => {
     assert.deepEqual(codes(bare), ['not-found']);
   });
 
+  it('flags the literal "undefined" that Adobe Analytics actually sends', () => {
+    // Measured: s.eVar119 is "undefined/<section>/..." on 30 pages (24 ford.mx,
+    // 6 ford.com.pr) and s.prop23 once. That is data already sent to AA.
+    const diagnosis = diagnoseEntry(entry({
+      adobeAnalytics: { s: { pageName: 'lobo', eVar119: 'undefined/esp/camiones/lobo/' }, satellite: null, dataLayer: null }
+    }));
+    const item = find(diagnosis, 'undefined-in-analytics');
+    assert.equal(item.severity, 'high');
+    assert.equal(item.attribution, 'site');
+    assert.equal(item.field, 's.eVar119');
+    assert.deepEqual(codes(diagnosis), ['undefined-in-analytics']);
+  });
+
+  it('flags a data-layer value that is a literal placeholder', () => {
+    const diagnosis = diagnoseEntry(entry({
+      digitalData: { page: { pageName: 'mx:es:legal' }, onclick: { contentType: 'undefined' } }
+    }));
+    const item = find(diagnosis, 'undefined-placeholder');
+    assert.equal(item.severity, 'medium');
+    assert.equal(item.attribution, 'site');
+    assert.equal(item.field, 'onclick.contentType');
+  });
+
+  it('does not confuse an absent key with the string "undefined"', () => {
+    // The common real case: onclick exists but contentType was never set. Reading
+    // it directly yields undefined; only a membership check proves the difference.
+    const absent = diagnoseEntry(entry({
+      digitalData: { page: { pageName: 'mx:es:legal' }, onclick: {} }
+    }));
+    assert.deepEqual(codes(absent), []);
+
+    const harmless = diagnoseEntry(entry({
+      digitalData: { page: { pageName: 'mx:es:legal' }, onclick: { contentType: 'undefined behavior:return:direct' } },
+      adobeAnalytics: { s: { pageName: 'legal', eVar119: 'undefined behavior/esp' }, satellite: null, dataLayer: null }
+    }));
+    assert.deepEqual(codes(harmless), []);
+  });
+
   it('still reports a real absence when the page answered 200', () => {
     const diagnosis = diagnoseEntry(noData({ http_status: 200 }));
     assert.equal(diagnosis.siteSeverity, 'high');
