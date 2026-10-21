@@ -120,6 +120,8 @@ diagnosticar sin crawlear el sitio otra vez.
 | `auth-wall` | medium | env | Redirigió a un IdP: la página pedida nunca se vio |
 | `not-found` | medium | env | HTTP 404/410: la URL ya no existe en ese entorno |
 | `error-page-no-pagename` | medium | site | La plantilla de error 404 está instrumentada y manda un page view de AA con `pageName` vacío |
+| `undefined-in-analytics` | high | site | Hay un valor literal `undefined` dentro del payload de AA: es dato ya enviado |
+| `undefined-placeholder` | medium | site | Un valor de `digitalData` es el literal `undefined` (placeholder de plantilla) |
 | `request-rejected` | high | env | HTTP 431/414: el servidor rechazó la *petición* (headers demasiado grandes); la página nunca corrió |
 | `invalid-status` | medium | tool | Estado fuera del enum del contrato |
 | `incomplete-entry` | medium | tool | El entry no trae `adobeAnalytics`: AA nunca se midió |
@@ -155,6 +157,23 @@ instrumentación que corregir.
 Los campos obligatorios son datos, no código: se pueden cambiar por plantilla con
 `diagnoseEntry(entry, { requiredFields: [...] })` cuando el cliente fije el
 contrato real.
+
+El literal `undefined` no es un valor: es lo que escribe una plantilla cuando la
+variable que interpoló no existía. Dos códigos lo detectan sin necesitar contrato
+alguno, porque no dependen de un valor esperado. `undefined-in-analytics` (high)
+mira el payload de AA, que ya salió: medido, `s.eVar119` viaja como
+`undefined/<seccion>/<pagina>` en 30 páginas (24 de `ford.mx`, 6 de `ford.com.pr`)
+y `s.prop23` una vez. `undefined-placeholder` (medium) mira `digitalData`, donde el
+placeholder solo llega a AA si el tag lo lee en el click: medido, una página de
+Lincoln con `onclick.contentType: "undefined"`. El match es exacto o por prefijo
+(`undefined/`, `undefined:`), para no marcar un valor real que mencione la palabra.
+
+Acá importa una distinción que cuesta caro: **una clave ausente no es la cadena
+`undefined`**. Sobre las 137 páginas medidas con `page`, `onclick.contentType` está
+ausente en la mayoría y presente con `undefined` en una sola; leerlo con acceso
+directo y coercionar con `String()` produce "undefined" en los dos casos y convierte
+una ausencia en un falso defecto. Los contadores se calculan con membership
+(`'k' in page`), nunca con truthiness.
 
 ### Calibración con una corrida real (155 URLs Ford/Lincoln MX)
 
@@ -285,7 +304,7 @@ Por eso el sobre de problemas y el de resumen llevan `completeness`:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 204 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 207 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,
