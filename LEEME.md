@@ -29,6 +29,17 @@
    - El resumen separa prod vs preview (mismo patrón del preflight) y el
      conteo de errores abre un modal con URL + mensaje de cada fallo.
 
+## Modo sitio (sitemap + enlaces)
+Marca "Auditar sitio" en el popup y pega hosts semilla (uno por línea, ej. `https://www.ford.mx`). La corrida deja de tratar la lista como definitiva:
+1. Descarga `https://<host>/sitemap.xml` (y sus hijos si es un índice) desde el worker, con la sesión del navegador. Si el sitemap no se puede leer, la corrida sigue con las semillas y el resumen lo informa.
+2. Suma al final de la cola los enlaces internos del mismo host encontrados en cada página, hasta la profundidad elegida (0 = solo semillas, 1 = sitemap, 2 = enlaces de esas páginas; por defecto 2, máximo 3).
+3. Deduplica por URL normalizada (sin fragmento, sin barra final, con query) y descarta assets (pdf, imágenes, css, js, etc.).
+4. Tope de 800 URLs por corrida: al alcanzarlo deja de encolar y el resumen muestra "tope de URLs alcanzado".
+
+Cada entry gana campos opcionales para el informe: `template` (`new` si la página carga el loader `metrics.ford.<locale>.js` o `metrics.lincoln.<locale>.js`; `old` si no), `metrics_files`, `metrics_locale`, `title`, `links_found` (anclas vistas en la página, no URLs nuevas), `has_fmc_context` (`FMC.context` en scripts inline) y `has_aa_beacon` (request a `smetrics.ford.com`). Son aditivos: el contrato de export no cambia y los importadores viejos los ignoran.
+
+La página de resultados agrega chips por tarjeta y filas de resumen (plantilla nueva/legacy, FMC.context, beacon Adobe), y el `ddJob.site` persistido conserva la profundidad, el conteo descubierto y los errores de sitemap para el resumen.
+
 ## Configuración opcional (background.js)
 - `POST_LOAD_WAIT_MS`: espera extra tras cargar la página antes de buscar el objeto (por defecto 1.5s).
 - `DIGITALDATA_MAX_WAIT_MS`: tiempo máximo reintentando buscar `window.digitalData` dentro de la página (por defecto 8s).
@@ -59,6 +70,7 @@ Adoptar la rama `perf/*` sin medirla es fe. El procedimiento:
 
 ## Notas
 - Si una página no define `window.digitalData`, aparecerá como "Sin digitalData".
+- La detección de plantilla depende de que el loader `metrics.ford.<locale>.js` (o `metrics.lincoln.<locale>.js`) esté en un `<script src>` de la página: si se inyecta desde un tag manager, la página queda como `old`. `FMC.context` y el beacon a `smetrics.ford.com` se reportan como corroboración, nunca promueven una página a `new`.
 - Requiere permisos amplios (`<all_urls>`) porque debe poder inyectar código en cualquier sitio que pegues.
 
 ## Persistencia (una clave por URL)

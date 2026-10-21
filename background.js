@@ -1,6 +1,6 @@
 // Optional local overrides (untracked). Copy config.example.js to config.local.js.
 try { importScripts('config.local.js'); } catch (e) { /* no local config: Ford bypass stays disabled */ }
-importScripts('lib/quota.js', 'lib/results.js', 'lib/status.js'); // pure helpers, also covered by node tests
+importScripts('lib/quota.js', 'lib/results.js', 'lib/status.js', 'lib/site.js', 'lib/urls.js'); // pure helpers, also covered by node tests
 
 // Tiempo extra tras "complete" para dejar que scripts async (analytics) definan digitalData
 const POST_LOAD_WAIT_MS = 1500;
@@ -20,6 +20,23 @@ const CONCURRENCY = 5;
 const TAB_LOAD_TIMEOUT_MS = 25000;
 // Per-entry cap so a single huge digitalData payload cannot blow the storage quota.
 const MAX_ENTRY_BYTES = 256 * 1024;
+
+// --- Site mode (sitemap + spider discovery) ---
+// A site run starts from seed URLs (usually one host root per market), expands
+// the queue with the host sitemap and with same-host links found while walking.
+// Depth 0 = seed, 1 = sitemap URLs, 2 = links found on those pages.
+const SITE_MAX_DEPTH_DEFAULT = 2;
+const SITE_MAX_DEPTH_LIMIT = 3;
+// Bounds the per-page link harvest so one page with a huge footer cannot flood
+// the queue (and the storage record).
+const SITE_MAX_LINKS_PER_PAGE = 400;
+const SITE_MAX_SITEMAP_CHILDREN = 30;
+// Hard ceiling for a site run: a production sitemap can list thousands of URLs,
+// which would never finish inside a browser session.
+const SITE_MAX_URLS = 800;
+// A sitemap fetch that never answers must not freeze the run: the watchdog would
+// only see "no progress" and restart into the same hang.
+const SITE_FETCH_TIMEOUT_MS = 15000;
 
 // --- Watchdog ---
 // MV3 may kill the service worker mid-run. Without a periodic wake-up nothing
@@ -77,7 +94,7 @@ let resumeInFlight = false;
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== 'string') return;
   if (msg.type === 'START_JOB') {
-    startJob(msg.urls).then(
+    startJob(msg.urls, msg.site).then(
       sendResponse,
       (e) => sendResponse({ ok: false, reason: 'error', message: String(e) })
     );
@@ -189,7 +206,24 @@ async function ensurePerfRules(enable) {
   }
 }
 
-async function startJob(urls) {
+// Normalizes the optional site-audit request. `null` means a plain URL-list run,
+// which keeps the previous behavior byte for byte.
+function siteMode(site) {
+  if (!site || typeof site !== 'object') return null;
+  const raw = Number(site.maxDepth);
+  const maxDepth = Number.isFinite(raw) ? Math.round(raw) : SITE_MAX_DEPTH_DEFAULT;
+  return {
+    maxDepth: Math.max(0, Math.min(SITE_MAX_DEPTH_LIMIT, maxDepth)),
+    discovered: 0,
+    sitemapErrors: [],
+    discoveredDone: false,
+    // Set when the sitemap/spider hit SITE_MAX_URLS: the run is complete but the
+    // site is not, and the report must say so instead of looking exhaustive.
+    capped: false
+  };
+}
+
+async function startJob(urls, site) {
   // A cancelled job is not a running job: it is only draining its in-flight
   // URLs, so a new run is allowed to take over.
   if (activeJob && !activeJob.handle.cancelled) return { ok: false, reason: 'already-running' };
@@ -210,9 +244,15 @@ async function startJob(urls) {
   const record = {
     status: 'running',
     urls: urls.slice(),
+    // Parallel to urls: crawl depth per entry (0 for a plain URL list).
+    depths: urls.map(() => 0),
+    // Seed count is frozen so a resume can rebuild the host allow-list even
+    // after discovery appended hundreds of URLs.
+    seedCount: urls.length,
     nextIndex: 0,
     startedAt: Date.now(),
-    tabIds: []
+    tabIds: [],
+    site: siteMode(site)
   };
   // Claim the slot synchronously so a second START_JOB cannot slip in.
   activeJob = newJob(record, new Set());
@@ -289,9 +329,24 @@ async function cancelJob() {
 // `done` is the set of indices already persisted. Payloads live in storage, so
 // the worker never accumulates every response in memory.
 function newJob(record, done) {
+  // Dedupe key set for the crawl queue. Rebuilt from the persisted list so a
+  // resumed run never re-enqueues a URL it already discovered.
+  const seen = new Set();
+  (Array.isArray(record.urls) ? record.urls : []).forEach((url) => {
+    const key = normalizeQueueUrl(url);
+    if (key) seen.add(key);
+  });
+  // Hosts a discovered URL must belong to: the seed hosts only, so a footer link
+  // to another market never widens the run.
+  const seeds = Array.isArray(record.urls)
+    ? record.urls.slice(0, record.seedCount || (record.site ? record.urls.length : 0))
+    : [];
+  const hostSet = new Set(seeds.map(hostOf).filter(Boolean));
   return {
     record,
     done: done || new Set(),
+    seen,
+    hostSet,
     handle: { cancelled: false, failed: null, superseded: false },
     // In-memory heartbeat for the watchdog; `at` in the progress payload is its
     // persisted twin, so a worker that dies mid-run can still be judged stalled.
@@ -475,11 +530,22 @@ async function watchdogTick() {
 
 async function runQueue(job) {
   const { record, handle } = job;
-  const urls = record.urls;
   await ensurePerfRules(true).catch(() => {});
 
+  // In site mode the sitemap expands the queue before the first tab opens. It is
+  // idempotent and re-runs on resume only when it never completed.
+  if (record.site && !record.site.discoveredDone) {
+    await discoverFromSitemaps(job);
+    if (handle.cancelled) return;
+  }
+
+  // Discovery can append URLs while other workers are still running, so a worker
+  // may only exit when the queue is empty AND nothing is in flight (otherwise it
+  // would quit before a sibling's links land).
+  let inflight = 0;
+
   function claim() {
-    while (record.nextIndex < urls.length) {
+    while (record.nextIndex < record.urls.length) {
       const idx = record.nextIndex++;
       if (!job.done.has(idx)) return idx;
     }
@@ -490,18 +556,145 @@ async function runQueue(job) {
     for (;;) {
       if (handle.cancelled) return;
       const idx = claim();
-      if (idx < 0) return;
+      if (idx < 0) {
+        if (inflight === 0) return;
+        await sleep(50);
+        continue;
+      }
 
-      const entry = await processUrl(urls[idx], idx, job);
-      // A cancelled job must never write again: its progress payload is stale,
-      // and a watchdog restart would let it overwrite the newer queue's counters.
-      if (handle.cancelled) return;
-      if (!(await persistEntry(job, idx, entry))) return;
+      inflight++;
+      try {
+        const outcome = await processUrl(record.urls[idx], idx, job);
+        // A cancelled job must never write again: its progress payload is stale,
+        // and a watchdog restart would let it overwrite the newer queue's counters.
+        if (handle.cancelled) return;
+        await maybeEnqueueLinks(job, idx, outcome.links);
+        if (!(await persistEntry(job, idx, outcome.entry))) return;
+      } finally {
+        inflight--;
+      }
     }
   }
 
-  const workers = Array.from({ length: Math.min(CONCURRENCY, urls.length) }, worker);
+  const workers = Array.from(
+    { length: Math.min(CONCURRENCY, Math.max(record.urls.length, 1)) },
+    worker
+  );
   await Promise.all(workers);
+}
+
+// ---- Site discovery ----
+
+function depthOf(job, idx) {
+  const depths = job.record.depths;
+  const depth = Array.isArray(depths) ? depths[idx] : 0;
+  return Number.isInteger(depth) ? depth : 0;
+}
+
+// Appends a URL discovered by the sitemap or the spider. Returns true when it was
+// actually added (dedupe + host allow-list live here, not at the call sites).
+function enqueueDiscovered(job, raw, depth) {
+  const key = normalizeQueueUrl(raw);
+  if (!key) return false;
+  if (job.hostSet.size && !job.hostSet.has(hostOf(key))) return false;
+  if (job.seen.has(key)) return false;
+  if (job.record.site && job.record.urls.length >= SITE_MAX_URLS) {
+    job.record.site.capped = true;
+    return false;
+  }
+  job.seen.add(key);
+  job.record.urls.push(key);
+  if (!Array.isArray(job.record.depths)) job.record.depths = [];
+  job.record.depths.push(depth);
+  return true;
+}
+
+async function discoverFromSitemaps(job) {
+  const record = job.record;
+  const seedCount = record.seedCount || record.urls.length;
+  const hosts = [...new Set(record.urls.slice(0, seedCount).map(hostOf).filter(Boolean))];
+  let added = 0;
+  // Discovery may re-run after an interrupted job: replace, don't append, or the
+  // report would show the same failure twice.
+  record.site.sitemapErrors = [];
+  for (const host of hosts) {
+    if (job.handle.cancelled) return;
+    const { urls, error } = await sitemapUrls(host);
+    if (error) record.site.sitemapErrors.push({ host, error });
+    urls.forEach((url) => {
+      if (enqueueDiscovered(job, url, 1)) added++;
+    });
+  }
+  record.site.discovered += added;
+  record.site.discoveredDone = true;
+  await persistJobRecord(job, true);
+}
+
+// Fetches /sitemap.xml from the worker. host_permissions is <all_urls>, so the
+// request carries the browser session that already passes Akamai.
+async function sitemapUrls(host) {
+  const root = `https://${host}/sitemap.xml`;
+  const text = await fetchText(root);
+  if (!text) return { urls: [], error: `${root} unreachable` };
+  const locs = parseSitemapLocs(text);
+  if (!isSitemapIndex(text)) return { urls: locs, error: null };
+  const out = [];
+  for (const child of locs.slice(0, SITE_MAX_SITEMAP_CHILDREN)) {
+    if (!/\.xml(\?|$)/i.test(child)) continue;
+    const childText = await fetchText(child);
+    if (childText) out.push(...parseSitemapLocs(childText));
+  }
+  return { urls: out, error: null };
+}
+
+async function fetchText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SITE_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { credentials: 'include', signal: controller.signal });
+    if (!response || !response.ok) return '';
+    return await response.text();
+  } catch (e) {
+    return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Harvests same-host links from a processed page up to the run's max depth.
+// The full link list stays in memory; the entry only keeps the count, so the
+// per-URL storage cost does not grow with the page footer size.
+async function maybeEnqueueLinks(job, idx, links) {
+  const site = job.record.site;
+  if (!site || !Array.isArray(links) || !links.length) return;
+  const depth = depthOf(job, idx);
+  if (depth >= site.maxDepth) return;
+
+  let added = 0;
+  links.slice(0, SITE_MAX_LINKS_PER_PAGE).forEach((raw) => {
+    if (enqueueDiscovered(job, raw, depth + 1)) added++;
+  });
+  if (!added) return;
+
+  site.discovered += added;
+  await persistJobRecord(job);
+}
+
+// The URL list grows during a site run, so it has to be rewritten when discovery
+// adds entries. `ddTotal` follows it (the popup and the summary read it).
+async function persistJobRecord(job, force) {
+  if (job.handle.cancelled) return;
+  const now = Date.now();
+  if (!force && job.lastQueuePersistAt && now - job.lastQueuePersistAt < 1000) return;
+  job.lastQueuePersistAt = now;
+  try {
+    await job.write({
+      [JOB_KEY]: snapshot(job.record),
+      ddTotal: job.record.urls.length
+    });
+  } catch (e) {
+    await handleStorageFailure(job, e);
+  }
 }
 
 // Retries transient failures only: a throttled tab creation or a discarded tab
@@ -511,9 +704,10 @@ async function runQueue(job) {
 // error messages stay comparable between runs.
 async function processUrl(url, idx, job) {
   for (let attempt = 1; ; attempt++) {
-    const { entry, retryable } = await attemptUrl(url, idx, job);
-    if (!retryable || attempt >= RETRY_MAX_ATTEMPTS || job.handle.cancelled) {
-      return capEntry(entry, MAX_ENTRY_BYTES);
+    const outcome = await attemptUrl(url, idx, job);
+    if (!outcome.retryable || attempt >= RETRY_MAX_ATTEMPTS || job.handle.cancelled) {
+      outcome.entry = capEntry(outcome.entry, MAX_ENTRY_BYTES);
+      return outcome;
     }
     await sleep(jitter(RETRY_BASE_DELAY_MS));
   }
@@ -526,9 +720,27 @@ function jitter(baseMs) {
 
 // A single attempt: one tab, one read of the data layer.
 async function attemptUrl(url, idx, job) {
-  const entry = { url, finalUrl: null, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
+  const entry = {
+    url,
+    finalUrl: null,
+    status: 'pending',
+    digitalData: null,
+    adobeAnalytics: null,
+    error: null,
+    truncated: false,
+    // Additive site-audit fields (the export contract only requires the fields
+    // above, so importers that ignore these keep working).
+    template: null,
+    metrics_files: [],
+    metrics_locale: null,
+    title: null,
+    links_found: 0,
+    has_fmc_context: null,
+    has_aa_beacon: null
+  };
   let tab;
   let retryable = false;
+  let links = [];
 
   try {
     await ensureFordCookie(url);
@@ -558,7 +770,7 @@ async function attemptUrl(url, idx, job) {
       entry.error = loadOutcome === 'gone'
         ? TAB_CLOSED_MESSAGE
         : 'Page failed to load: ' + pageUrl;
-      return { entry, retryable };
+      return { entry, retryable, links };
     }
 
     await sleep(POST_LOAD_WAIT_MS);
@@ -571,6 +783,9 @@ async function attemptUrl(url, idx, job) {
     });
 
     const payload = injection && injection[0] ? injection[0].result : null;
+    // Site-audit metadata is captured even when the page has no data layer: a
+    // template-new page without digitalData is exactly what the report flags.
+    links = applyPageInfo(entry, payload && payload.page);
     if (!payload || typeof payload !== 'object') {
       const result = noDataResult(loadOutcome);
       entry.status = result.status;
@@ -604,7 +819,22 @@ async function attemptUrl(url, idx, job) {
     }
   }
 
-  return { entry, retryable };
+  return { entry, retryable, links };
+}
+
+// Classifies the page-level metadata captured inside the visited page. Kept in
+// the worker (not injected) so the pure helpers stay unit-testable in lib/.
+function applyPageInfo(entry, page) {
+  if (!page || typeof page !== 'object') return [];
+  const classified = classifyTemplate(page.scripts || [], page.fmc_blocks || 0);
+  entry.template = classified.template;
+  entry.metrics_files = classified.metrics_files;
+  entry.metrics_locale = classified.metrics_locale;
+  entry.has_fmc_context = classified.has_fmc_context;
+  entry.has_aa_beacon = !!page.has_aa_beacon;
+  entry.title = page.title ? String(page.title) : null;
+  entry.links_found = Array.isArray(page.links) ? page.links.length : 0;
+  return Array.isArray(page.links) ? page.links : [];
 }
 
 // ---- Wait for tab load ----
@@ -696,6 +926,9 @@ function snapshot(record) {
   return {
     status: record.status,
     urls: record.urls,
+    depths: Array.isArray(record.depths) ? record.depths.slice() : [],
+    seedCount: record.seedCount || 0,
+    site: record.site || null,
     nextIndex: record.nextIndex,
     startedAt: record.startedAt,
     tabIds: Array.isArray(record.tabIds) ? record.tabIds.slice() : []
@@ -747,10 +980,13 @@ async function handleStorageFailure(job, error) {
   console.warn('DigitalData: storage write failed, aborting job:', message);
   try { await removeKeys([LEGACY_RESULTS_KEY]); } catch (e) { /* ignore */ }
   try {
+    // Write the terminal marker and the status in the same set: a reader that
+    // sees "not running" must never observe the previous "running" record.
     await storageSet({
       [RUNNING_KEY]: false,
       [JOB_ERROR_KEY]: job.handle.failed,
-      ddFinishedAt: Date.now()
+      ddFinishedAt: Date.now(),
+      [JOB_KEY]: snapshot({ ...job.record, status: 'aborted', tabIds: [] })
     });
   } catch (e) {
     // Storage is still full: the in-memory flag already stops the queue and
@@ -897,11 +1133,11 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
         }
       }
       if (dd && stableCount >= requiredPolls) {
-        resolve({ dd: dd, aa: collectAdobe() });
+        resolve({ dd: dd, aa: collectAdobe(), page: collectPage() });
       } else if (safeNow() - start > maxWaitMs) {
         // Nunca se estabilizó: devolvemos lo último visto (o null) en vez de
         // inventar un OK con el primer valor parcial.
-        resolve({ dd: best, aa: collectAdobe() });
+        resolve({ dd: best, aa: collectAdobe(), page: collectPage() });
       } else {
         setTimeout(check, intervalMs);
       }
@@ -961,6 +1197,43 @@ function extractPageAnalytics(maxWaitMs, intervalMs, stablePolls) {
       } catch (e) { /* ignore */ }
       if (!s && !satellite && !dataLayer) return null;
       return { s: s, satellite: satellite, dataLayer: dataLayer };
+    }
+
+    // Page-level snapshot used by site mode: the template marker lives in the
+    // script tags, the crawl frontier in the anchors. Bounded on purpose; the
+    // full HTML is never serialized (it is megabytes on these pages).
+    function collectPage() {
+      const page = { title: '', scripts: [], links: [], fmc_blocks: 0, has_aa_beacon: false };
+      try { page.title = String(document.title || ''); } catch (e) { /* ignore */ }
+      try {
+        const nodes = document.querySelectorAll('script[src]');
+        for (let i = 0; i < nodes.length && page.scripts.length < 80; i++) {
+          const src = nodes[i].src;
+          if (src) page.scripts.push(String(src));
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const anchors = document.querySelectorAll('a[href]');
+        for (let i = 0; i < anchors.length && page.links.length < 400; i++) {
+          const href = anchors[i].href;
+          if (href) page.links.push(String(href));
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const inline = document.querySelectorAll('script:not([src])');
+        let fmc = 0;
+        for (let i = 0; i < inline.length; i++) {
+          const text = inline[i].textContent || '';
+          const found = text.match(/FMC\.context\.\w+/g);
+          if (found) fmc += found.length;
+        }
+        page.fmc_blocks = fmc;
+      } catch (e) { /* ignore */ }
+      try {
+        const entries = performance.getEntriesByType('resource');
+        page.has_aa_beacon = entries.some((entry) => /smetrics\.ford\.com/i.test(entry.name));
+      } catch (e) { /* ignore */ }
+      return page;
     }
 
     check();

@@ -33,6 +33,11 @@
     gap: 8px;
     margin-top: 10px;
   }
+  /* Author styles beat the UA rule for [hidden]; without this the depth row
+     would stay visible before site mode is on. */
+  [hidden] {
+    display: none !important;
+  }
   button {
     flex: 1;
     border: none;
@@ -72,12 +77,33 @@
     color: #6b7280;
     margin-top: 6px;
   }
+  .opt {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #d1d5db;
+  }
+  #siteDepth {
+    width: 52px;
+    background: #1f2937;
+    color: #f3f4f6;
+    border: 1px solid #374151;
+    border-radius: 4px;
+    padding: 2px 4px;
+  }
 </style>
 </head>
 <body>
   <h1>DigitalData Extractor</h1>
   <textarea id="urls" placeholder="https://ejemplo.com/pagina1&#10;https://ejemplo.com/pagina2&#10;https://ejemplo.com/pagina3"></textarea>
   <div class="hint">Pega una URL por línea.</div>
+  <div class="row">
+    <label class="opt"><input type="checkbox" id="siteMode" /> Auditar sitio (sitemap + enlaces)</label>
+  </div>
+  <div class="row" id="siteOpts" hidden>
+    <label class="opt">Profundidad <input type="number" id="siteDepth" value="2" min="0" max="3" /></label>
+  </div>
   <div class="row">
     <button id="start">Abrir y analizar</button>
     <button id="cancel">Cancelar</button>

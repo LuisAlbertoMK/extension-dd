@@ -41,6 +41,17 @@ describe('isPreviewUrl', () => {
     assert.equal(isPreviewUrl('http://localhost:4502/content/x'), true);
   });
 
+  it('flags brand author instances and AEM editor sessions', () => {
+    assert.equal(isPreviewUrl('https://www.brandauthoraplb.ford.com/content/ford/mx/es_mx/home/x.html?wcmmode=disabled'), true);
+    assert.equal(isPreviewUrl('https://www.ford.mx/camiones/lobo/?wcmmode=edit'), true);
+  });
+
+  it('does not read production paths as preview hosts', () => {
+    // "test-drive" in a path is a product page, not a test environment.
+    assert.equal(isPreviewUrl('https://www.lincoln.mx/overlay/request-a-test-drive-home/'), false);
+    assert.equal(isPreviewUrl('https://www.ford.mx/promociones/concurso/'), false);
+  });
+
   it('passes production hosts', () => {
     assert.equal(isPreviewUrl('https://www.example.com/model/xyz'), false);
     assert.equal(isPreviewUrl('https://wwwac.shop.brandx.ford.com/model'), false);

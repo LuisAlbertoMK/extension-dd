@@ -104,6 +104,32 @@ describe('buildCombinedJson', () => {
     assert.equal(out[0].adobeAnalytics, null);
     assert.equal(out[0].truncated, false);
   });
+
+  it('adds site-audit fields only when the capture produced them', () => {
+    const out = buildCombinedJson({
+      '0__https://x.example/': { url: 'https://x.example/', status: 'ok', digitalData: {}, error: null },
+      '1__https://x.example/a': {
+        url: 'https://x.example/a',
+        status: 'ok',
+        digitalData: {},
+        error: null,
+        template: 'new',
+        metrics_files: ['/acservices/metrics.ford.es_mx.js'],
+        metrics_locale: 'es_mx',
+        title: 'Autos',
+        links_found: 12,
+        has_fmc_context: true,
+        has_aa_beacon: false
+      }
+    });
+    assert.ok(!('template' in out[0]), 'legacy entries keep the original shape');
+    assert.equal(out[1].template, 'new');
+    assert.deepEqual(out[1].metrics_files, ['/acservices/metrics.ford.es_mx.js']);
+    assert.equal(out[1].metrics_locale, 'es_mx');
+    assert.equal(out[1].links_found, 12);
+    assert.equal(out[1].has_fmc_context, true);
+    assert.equal(out[1].has_aa_beacon, false);
+  });
 });
 
 describe('buildDDJson / buildAAJson', () => {
@@ -173,5 +199,17 @@ describe('buildSummary', () => {
     assert.equal(s.elapsedMs, null);
     assert.equal(s.avgMsPerUrl, null);
     assert.deepEqual(s.topErrors, []);
+    assert.deepEqual(s.byTemplate, { new: 0, old: 0, unknown: 0 });
+  });
+
+  it('buckets the template marker and the FMC/beacon corroborators', () => {
+    const s = buildSummary([
+      { idx: 0, entry: { url: 'https://x.example/a', status: 'ok', template: 'new', has_fmc_context: true, has_aa_beacon: true, error: null } },
+      { idx: 1, entry: { url: 'https://x.example/b', status: 'ok', template: 'old', has_fmc_context: false, has_aa_beacon: false, error: null } },
+      { idx: 2, entry: { url: 'https://x.example/c', status: 'error', error: 'boom' } }
+    ], {});
+    assert.deepEqual(s.byTemplate, { new: 1, old: 1, unknown: 1 });
+    assert.deepEqual(s.fmcContext, { with: 1, without: 2 });
+    assert.deepEqual(s.aaBeacon, { with: 1, without: 2 });
   });
 });
