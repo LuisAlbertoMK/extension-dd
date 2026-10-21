@@ -258,7 +258,7 @@ hizo la corrida no producía ese campo" se ven idénticos, y esa ambigüedad ya
 costó una corrida.
 
 - `manifest.json` es la versión de la extensión y se sube con **cada cambio de
-  comportamiento** (hoy `1.1.4`). El export de resumen y el de problemas llevan
+  comportamiento** (hoy `1.1.5`). El export de resumen y el de problemas llevan
   `extensionVersion`: si un export nuevo no lo trae, la recarga no tomó.
 - El export de problemas lleva además `rulesVersion` (constante `RULES_VERSION`
   en `lib/diagnose.js`). Se sube cuando una regla cambia el significado de un
