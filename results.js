@@ -2,6 +2,29 @@ const listEl = document.getElementById('list');
 const summaryEl = document.getElementById('summary');
 const statsEl = document.getElementById('stats');
 let lastEntries = [];
+let entriesByIndex = new Map();
+let cardEls = new Map();
+let lastMeta = { total: 0, running: false, startedAt: null, finishedAt: null, jobError: null };
+let reloadTimer = null;
+
+function metaFromStorage(raw) {
+  return {
+    total: raw.ddTotal || 0,
+    running: !!raw.ddJobRunning,
+    startedAt: raw.ddStartedAt,
+    finishedAt: raw.ddFinishedAt,
+    jobError: raw.ddJobError || null
+  };
+}
+
+function describeJobError(code) {
+  switch (code) {
+    case 'storage-quota': return 'almacenamiento lleno (cuota)';
+    case 'storage-write': return 'error de escritura en el almacenamiento';
+    case 'cancelled': return 'cancelada';
+    default: return code || 'error desconocido';
+  }
+}
 
 function classifyEnv(url) {
   try {
@@ -26,77 +49,133 @@ function statusLabel(status) {
 
 // entryIndex, orderedResults, buildCombinedJson and formatElapsed live in lib/.
 
-async function loadResults() {
-  const { ddResults, ddTotal, ddJobRunning, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
-    'ddResults',
-    'ddTotal',
-    'ddJobRunning',
-    'ddStartedAt',
-    'ddFinishedAt'
-  ]);
-  const entries = orderedResults(ddResults || {});
-  const elapsed = formatElapsed(ddStartedAt, ddJobRunning ? Date.now() : ddFinishedAt);
+function buildCard(entry) {
+  const card = document.createElement('div');
+  card.className = 'card';
 
-  summaryEl.textContent = ddJobRunning
-    ? `Procesando... ${entries.length}/${ddTotal || 0} · ${elapsed}`
-    : `${entries.length}/${ddTotal || entries.length} URLs procesadas en ${elapsed}`;
+  const header = document.createElement('div');
+  header.className = 'card-header';
 
-  renderStats(buildSummary(entries, {
-    startedAt: ddStartedAt,
-    finishedAt: ddJobRunning ? Date.now() : ddFinishedAt
-  }, classifyEnv));
-  lastEntries = entries;
+  const urlSpan = document.createElement('span');
+  urlSpan.className = 'url';
+  urlSpan.textContent = entry.url;
 
-  if (!entries.length) {
-    listEl.innerHTML = '<div class="empty">Todavía no hay resultados. Ejecuta un análisis desde el popup de la extensión.</div>';
-    return;
+  const badge = document.createElement('span');
+  badge.className = `badge ${badgeClass(entry.status)}`;
+  badge.textContent = statusLabel(entry.status);
+
+  header.appendChild(urlSpan);
+  header.appendChild(badge);
+
+  const pre = document.createElement('pre');
+  if (entry.status === 'error') {
+    pre.textContent = 'Error: ' + entry.error;
+  } else if (entry.status === 'no-data') {
+    pre.textContent = 'No se encontró window.digitalData ni datos de Adobe Analytics en esta página.';
+  } else if (entry.truncated && typeof entry.digitalData === 'string') {
+    pre.textContent = entry.digitalData +
+      '\n\n[... contenido truncado por límite de almacenamiento ...]';
+  } else {
+    pre.textContent = JSON.stringify(entry.digitalData, null, 2);
+  }
+  if (entry.adobeAnalytics) {
+    pre.textContent += '\n\n--- Adobe Analytics ---\n' +
+      JSON.stringify(entry.adobeAnalytics, null, 2);
   }
 
+  card.appendChild(header);
+  if (entry.finalUrl && entry.finalUrl !== entry.url) {
+    const redir = document.createElement('div');
+    redir.className = 'redirect';
+    redir.textContent = '→ ' + entry.finalUrl;
+    card.appendChild(redir);
+  }
+  card.appendChild(pre);
+  return card;
+}
+
+function renderSummary() {
+  const meta = lastMeta;
+  const done = lastEntries.length;
+  const elapsed = formatElapsed(meta.startedAt, meta.running ? Date.now() : meta.finishedAt);
+  if (meta.jobError === 'cancelled') {
+    summaryEl.textContent = `Corrida cancelada · ${done}/${meta.total || done} procesadas · ${elapsed}`;
+  } else if (meta.jobError) {
+    summaryEl.textContent = `Corrida detenida por ${describeJobError(meta.jobError)} · ${done}/${meta.total || done} procesadas · ${elapsed}`;
+  } else if (meta.running) {
+    summaryEl.textContent = `Procesando... ${done}/${meta.total || 0} · ${elapsed}`;
+  } else {
+    summaryEl.textContent = `${done}/${meta.total || done} URLs procesadas en ${elapsed}`;
+  }
+  renderStats(buildSummary(lastEntries, {
+    startedAt: meta.startedAt,
+    finishedAt: meta.running ? Date.now() : meta.finishedAt
+  }, classifyEnv));
+}
+
+function renderList(entries) {
   listEl.innerHTML = '';
-  entries.forEach(({ entry }) => {
-    const card = document.createElement('div');
-    card.className = 'card';
-
-    const header = document.createElement('div');
-    header.className = 'card-header';
-
-    const urlSpan = document.createElement('span');
-    urlSpan.className = 'url';
-    urlSpan.textContent = entry.url;
-
-    const badge = document.createElement('span');
-    badge.className = `badge ${badgeClass(entry.status)}`;
-    badge.textContent = statusLabel(entry.status);
-
-    header.appendChild(urlSpan);
-    header.appendChild(badge);
-
-    const pre = document.createElement('pre');
-    if (entry.status === 'error') {
-      pre.textContent = 'Error: ' + entry.error;
-    } else if (entry.status === 'no-data') {
-      pre.textContent = 'No se encontró window.digitalData ni datos de Adobe Analytics en esta página.';
-    } else if (entry.truncated && typeof entry.digitalData === 'string') {
-      pre.textContent = entry.digitalData +
-        '\n\n[... contenido truncado por límite de almacenamiento ...]';
-    } else {
-      pre.textContent = JSON.stringify(entry.digitalData, null, 2);
-    }
-    if (entry.adobeAnalytics) {
-      pre.textContent += '\n\n--- Adobe Analytics ---\n' +
-        JSON.stringify(entry.adobeAnalytics, null, 2);
-    }
-
-    card.appendChild(header);
-    if (entry.finalUrl && entry.finalUrl !== entry.url) {
-      const redir = document.createElement('div');
-      redir.className = 'redirect';
-      redir.textContent = '→ ' + entry.finalUrl;
-      card.appendChild(redir);
-    }
-    card.appendChild(pre);
+  cardEls = new Map();
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Todavía no hay resultados. Ejecuta un análisis desde el popup de la extensión.';
+    listEl.appendChild(empty);
+    return;
+  }
+  entries.forEach(({ idx, entry }) => {
+    const card = buildCard(entry);
+    cardEls.set(idx, card);
     listEl.appendChild(card);
   });
+}
+
+function applyResults(results, meta) {
+  lastMeta = meta;
+  lastEntries = orderedResults(results);
+  entriesByIndex = new Map(lastEntries.map(({ idx, entry }) => [idx, entry]));
+  renderList(lastEntries);
+  renderSummary();
+}
+
+// One new result: rebuild only its card and the (cheap) summary. Rendering the
+// whole list on every storage write froze the tab on long runs.
+function upsertResult(idx, entry) {
+  entriesByIndex.set(idx, entry);
+  lastEntries = orderedResults(Object.fromEntries(entriesByIndex));
+
+  const card = buildCard(entry);
+  const existing = cardEls.get(idx);
+  if (existing) {
+    existing.replaceWith(card);
+  } else {
+    const empty = listEl.querySelector('.empty');
+    if (empty) empty.remove();
+    const next = lastEntries.find(({ idx: i }) => i > idx);
+    const nextEl = next ? cardEls.get(next.idx) : null;
+    if (nextEl) listEl.insertBefore(card, nextEl);
+    else listEl.appendChild(card);
+  }
+  cardEls.set(idx, card);
+  renderSummary();
+}
+
+async function loadResults() {
+  const raw = await chrome.storage.local.get(null);
+  applyResults(collectResults(raw), metaFromStorage(raw));
+}
+
+async function refreshMeta() {
+  const raw = await chrome.storage.local.get([
+    'ddTotal', 'ddJobRunning', 'ddStartedAt', 'ddFinishedAt', 'ddJobError'
+  ]);
+  lastMeta = metaFromStorage(raw);
+  renderSummary();
+}
+
+async function readStoredResults() {
+  const raw = await chrome.storage.local.get(null);
+  return collectResults(raw);
 }
 
 // Renders the audit summary with textContent only (entries may carry untrusted strings).
@@ -168,12 +247,13 @@ function closeErrorModal() {
 }
 
 document.getElementById('downloadSummary').addEventListener('click', async () => {
-  const { ddResults, ddTotal, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
-    'ddResults', 'ddTotal', 'ddStartedAt', 'ddFinishedAt'
-  ]);
-  const summary = buildSummary(orderedResults(ddResults || {}), { startedAt: ddStartedAt, finishedAt: ddFinishedAt }, classifyEnv);
+  const raw = await chrome.storage.local.get(null);
+  const summary = buildSummary(orderedResults(collectResults(raw)), {
+    startedAt: raw.ddStartedAt,
+    finishedAt: raw.ddFinishedAt
+  }, classifyEnv);
   summary.generatedAt = new Date().toISOString();
-  summary.expectedTotal = ddTotal || summary.total;
+  summary.expectedTotal = raw.ddTotal || summary.total;
   const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -194,27 +274,31 @@ function downloadFile(name, obj) {
 }
 
 document.getElementById('downloadJson').addEventListener('click', async () => {
-  const { ddResults } = await chrome.storage.local.get('ddResults');
-  downloadFile(`digitalData-resultados-${Date.now()}.json`, buildCombinedJson(ddResults || {}));
+  const results = await readStoredResults();
+  downloadFile(`digitalData-resultados-${Date.now()}.json`, buildCombinedJson(results));
 });
 
 document.getElementById('downloadDD').addEventListener('click', async () => {
-  const { ddResults } = await chrome.storage.local.get('ddResults');
-  downloadFile(`digitalData-dd-${Date.now()}.json`, buildDDJson(ddResults || {}));
+  const results = await readStoredResults();
+  downloadFile(`digitalData-dd-${Date.now()}.json`, buildDDJson(results));
 });
 
 document.getElementById('downloadAA').addEventListener('click', async () => {
-  const { ddResults } = await chrome.storage.local.get('ddResults');
-  downloadFile(`digitalData-aa-${Date.now()}.json`, buildAAJson(ddResults || {}));
+  const results = await readStoredResults();
+  downloadFile(`digitalData-aa-${Date.now()}.json`, buildAAJson(results));
 });
 
 document.getElementById('copyJson').addEventListener('click', async () => {
-  const { ddResults } = await chrome.storage.local.get('ddResults');
-  const combined = buildCombinedJson(ddResults || {});
-  await navigator.clipboard.writeText(JSON.stringify(combined, null, 2));
+  const results = await readStoredResults();
+  const combined = buildCombinedJson(results);
   const btn = document.getElementById('copyJson');
   const original = btn.textContent;
-  btn.textContent = '¡Copiado!';
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(combined, null, 2));
+    btn.textContent = '¡Copiado!';
+  } catch (e) {
+    btn.textContent = 'No se pudo copiar';
+  }
   setTimeout(() => (btn.textContent = original), 1200);
 });
 
@@ -229,7 +313,30 @@ document.addEventListener('keydown', (e) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local') loadResults();
+  if (area !== 'local') return;
+  const keys = Object.keys(changes);
+
+  // A new run removes the previous result keys; rebuild from scratch.
+  const cleared = keys.some((key) =>
+    changes[key].newValue === undefined && (isResultKey(key) || key === 'ddResults' || key === 'ddJob')
+  );
+  if (cleared) {
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(loadResults, 150);
+    return;
+  }
+
+  keys.filter(isResultKey).forEach((key) => {
+    const idx = parseInt(key.slice(RESULT_PREFIX.length), 10);
+    const entry = changes[key].newValue;
+    if (!Number.isInteger(idx) || !entry) return;
+    upsertResult(idx, entry);
+  });
+
+  if (keys.some((key) => key === 'ddJobRunning' || key === 'ddJobError' ||
+      key === 'ddFinishedAt' || key === 'ddStartedAt' || key === 'ddTotal')) {
+    refreshMeta();
+  }
 });
 
 loadResults();

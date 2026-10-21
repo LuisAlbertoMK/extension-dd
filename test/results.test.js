@@ -1,7 +1,65 @@
 // Unit tests for lib/results.js — run with: npm test
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { entryIndex, orderedResults, buildCombinedJson, buildDDJson, buildAAJson, buildSummary } = require('../lib/results.js');
+const {
+  RESULT_PREFIX,
+  resultKey,
+  collectResults,
+  entryIndex,
+  orderedResults,
+  buildCombinedJson,
+  buildDDJson,
+  buildAAJson,
+  buildSummary
+} = require('../lib/results.js');
+
+describe('resultKey / collectResults', () => {
+  it('builds one prefixed storage key per index', () => {
+    assert.equal(RESULT_PREFIX, 'ddR:');
+    assert.equal(resultKey(0), 'ddR:0');
+    assert.equal(resultKey(42), 'ddR:42');
+  });
+
+  it('collects only result keys and restores numeric order', () => {
+    const storage = {
+      'ddR:2': { url: 'https://x.example/c', status: 'ok' },
+      'ddR:0': { url: 'https://x.example/a', status: 'ok' },
+      'ddR:1': { url: 'https://x.example/b', status: 'no-data' },
+      ddTotal: 3,
+      ddJobRunning: false,
+      ddJob: { status: 'idle' }
+    };
+    const results = collectResults(storage);
+    assert.deepEqual(Object.keys(results), ['0', '1', '2']);
+    assert.deepEqual(
+      orderedResults(results).map((r) => r.entry.url),
+      ['https://x.example/a', 'https://x.example/b', 'https://x.example/c']
+    );
+  });
+
+  it('ignores malformed keys and non-object entries', () => {
+    const storage = {
+      'ddR:abc': { url: 'https://x.example/bad' },
+      'ddR:1': 'not-an-entry',
+      'ddSomething:2': { url: 'https://x.example/other' }
+    };
+    assert.deepEqual(collectResults(storage), {});
+  });
+
+  it('falls back to the legacy ddResults snapshot', () => {
+    const legacy = { '0__https://x.example/a': { url: 'https://x.example/a' } };
+    assert.deepEqual(collectResults({ ddResults: legacy }), legacy);
+  });
+
+  it('prefers per-URL keys when both layouts exist', () => {
+    const results = collectResults({
+      'ddR:0': { url: 'https://x.example/new' },
+      ddResults: { '0__https://x.example/old': { url: 'https://x.example/old' } }
+    });
+    assert.deepEqual(Object.keys(results), ['0']);
+    assert.equal(results['0'].url, 'https://x.example/new');
+  });
+});
 
 describe('entryIndex', () => {
   it('parses the numeric prefix of storage keys', () => {

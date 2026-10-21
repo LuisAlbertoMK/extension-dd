@@ -1,23 +1,40 @@
 const urlsEl = document.getElementById('urls');
 const statusEl = document.getElementById('status');
 const startBtn = document.getElementById('start');
+const cancelBtn = document.getElementById('cancel');
 const viewBtn = document.getElementById('viewResults');
 
 // parseUrls, isPreviewUrl and formatElapsed live in lib/ (loaded before this script).
 
+function describeJobError(code) {
+  switch (code) {
+    case 'storage-quota': return 'almacenamiento lleno';
+    case 'storage-write': return 'error de escritura';
+    case 'cancelled': return 'cancelada';
+    default: return code || 'error';
+  }
+}
+
 async function refreshStatus() {
-  const { ddJobRunning, ddTotal, ddResults, ddStartedAt, ddFinishedAt } = await chrome.storage.local.get([
-    'ddJobRunning',
-    'ddTotal',
-    'ddResults',
-    'ddStartedAt',
-    'ddFinishedAt'
-  ]);
-  const done = ddResults ? Object.keys(ddResults).length : 0;
+  const { ddJobRunning, ddTotal, ddProgress, ddJobError, ddStartedAt, ddFinishedAt } =
+    await chrome.storage.local.get([
+      'ddJobRunning',
+      'ddTotal',
+      'ddProgress',
+      'ddJobError',
+      'ddStartedAt',
+      'ddFinishedAt'
+    ]);
+  const done = ddProgress && typeof ddProgress.done === 'number' ? ddProgress.done : 0;
   startBtn.disabled = !!ddJobRunning;
+  cancelBtn.disabled = !ddJobRunning;
   const elapsed = formatElapsed(ddStartedAt, ddJobRunning ? Date.now() : ddFinishedAt);
   if (ddJobRunning) {
     statusEl.textContent = `Procesando... ${done}/${ddTotal || 0} completadas · ${elapsed}`;
+  } else if (ddJobError === 'cancelled') {
+    statusEl.textContent = `Corrida cancelada · ${done}/${ddTotal || done} procesadas. Pulsa "Ver resultados".`;
+  } else if (ddJobError) {
+    statusEl.textContent = `Corrida detenida por ${describeJobError(ddJobError)} · ${done}/${ddTotal || done} procesadas. Pulsa "Ver resultados".`;
   } else if (ddTotal) {
     statusEl.textContent = `Última corrida: ${done}/${ddTotal} completadas en ${elapsed}. Pulsa "Ver resultados".`;
   } else {
@@ -69,6 +86,22 @@ startBtn.addEventListener('click', async () => {
     startBtn.disabled = false;
     statusEl.textContent = 'No se pudo iniciar el análisis.';
   }
+});
+
+cancelBtn.addEventListener('click', async () => {
+  cancelBtn.disabled = true;
+  statusEl.textContent = 'Cancelando...';
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'CANCEL_JOB' });
+    if (res && res.ok === false) {
+      statusEl.textContent = res.reason === 'no-job'
+        ? 'No hay un análisis en curso.'
+        : 'No se pudo cancelar el análisis.';
+    }
+  } catch (e) {
+    statusEl.textContent = 'No se pudo cancelar el análisis.';
+  }
+  refreshStatus();
 });
 
 viewBtn.addEventListener('click', () => {
