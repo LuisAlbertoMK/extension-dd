@@ -6,7 +6,12 @@
   "scripts": {
     "test": "node --test test/",
     "parity": "node tools/parity-check.js",
-    "compare": "node tools/compare-summaries.js"
+    "compare": "node tools/compare-summaries.js",
+    "diagnose": "node tools/diagnose.js",
+    "compare-diagnosis": "node tools/compare-diagnosis.js",
+    "check:secrets": "node tools/check-secrets.js",
+    "contract:build": "node tools/contract.js build",
+    "contract:check": "node tools/contract.js check"
   },
   "license": "UNLICENSED"
 }

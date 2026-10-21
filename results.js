@@ -15,8 +15,21 @@ function metaFromStorage(raw) {
     startedAt: raw.ddStartedAt,
     finishedAt: raw.ddFinishedAt,
     jobError: raw.ddJobError || null,
-    site: job.site || null
+    site: job.site || null,
+    // The submitted queue, kept so an export can name the URLs that never ran.
+    urls: Array.isArray(job.urls) ? job.urls : []
   };
+}
+
+// Completeness of the run behind the current results: what was submitted versus
+// what produced an entry. Computed on demand for downloads, and from lastMeta for
+// the summary row.
+function completenessOf(meta, done) {
+  return captureCompleteness(
+    { urls: meta && meta.urls ? meta.urls : [] },
+    done,
+    { expectedTotal: meta ? meta.total : 0, cancelled: !!(meta && meta.jobError === 'cancelled') }
+  );
 }
 
 function describeJobError(code) {
@@ -36,6 +49,41 @@ function classifyEnv(url) {
   }
 }
 
+// Diagnosis options live here because isPreviewUrl is a page global (lib/urls.js).
+const DIAG_OPTIONS = {
+  isPreviewUrl: (url) => classifyEnv(url) === 'preview'
+};
+
+// Which build produced an export. Without it, an export that lacks a new field
+// cannot be told apart from a capture that simply did not produce it. The
+// manifest version is the identifier Chrome guarantees, so it is bumped with
+// every behavior change instead of being remembered by hand.
+function extensionVersion() {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch (e) {
+    return null;
+  }
+}
+
+// A diagnosis is derived from the stored entry, never persisted: rules can
+// change and the same run can be re-diagnosed without crawling again.
+// Cached per index: renderSummary runs on every storage write, and re-diagnosing
+// the whole list each time would be the O(n^2) trap the list rendering already has.
+const diagnosisCache = new Map();
+
+function diagnosisFor(idx, entry) {
+  const cached = diagnosisCache.get(idx);
+  if (cached) return cached;
+  const diagnosis = diagnoseEntry(Object.assign({}, entry, { index: idx }), DIAG_OPTIONS);
+  diagnosisCache.set(idx, diagnosis);
+  return diagnosis;
+}
+
+function currentDiagnosis() {
+  return summarizeDiagnosis(lastEntries.map(({ idx, entry }) => diagnosisFor(idx, entry)));
+}
+
 function badgeClass(status) {
   return status || 'pending';
 }
@@ -51,9 +99,10 @@ function statusLabel(status) {
 
 // entryIndex, orderedResults, buildCombinedJson and formatElapsed live in lib/.
 
-function buildCard(entry) {
+function buildCard(entry, idx) {
   const card = document.createElement('div');
   card.className = 'card';
+  const diagnosis = diagnosisFor(idx, entry);
 
   const header = document.createElement('div');
   header.className = 'card-header';
@@ -108,6 +157,12 @@ function buildCard(entry) {
   if (entry.has_fmc_context) chip('FMC.context', 'fmc');
   if (entry.has_aa_beacon) chip('Beacon AA', 'aa');
   if (entry.links_found) chip(entry.links_found + ' enlaces', 'links');
+  diagnosis.problems.slice(0, 4).forEach((problem) => {
+    chip(problem.code, 'sev-' + problem.severity);
+  });
+  if (diagnosis.problems.length > 4) {
+    chip(`+${diagnosis.problems.length - 4} más`, 'sev-' + diagnosis.severity);
+  }
   if (chips.childNodes.length) card.appendChild(chips);
   card.appendChild(pre);
   return card;
@@ -134,12 +189,13 @@ function renderSummary() {
   renderStats(buildSummary(lastEntries, {
     startedAt: meta.startedAt,
     finishedAt: meta.running ? Date.now() : meta.finishedAt
-  }, classifyEnv));
+  }, classifyEnv), currentDiagnosis(), completenessOf(meta, lastEntries.map(({ idx }) => idx)));
 }
 
 function renderList(entries) {
   listEl.innerHTML = '';
   cardEls = new Map();
+  diagnosisCache.clear();
   if (!entries.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
@@ -148,7 +204,7 @@ function renderList(entries) {
     return;
   }
   entries.forEach(({ idx, entry }) => {
-    const card = buildCard(entry);
+    const card = buildCard(entry, idx);
     cardEls.set(idx, card);
     listEl.appendChild(card);
   });
@@ -168,7 +224,8 @@ function upsertResult(idx, entry) {
   entriesByIndex.set(idx, entry);
   lastEntries = orderedResults(Object.fromEntries(entriesByIndex));
 
-  const card = buildCard(entry);
+  diagnosisCache.delete(idx);
+  const card = buildCard(entry, idx);
   const existing = cardEls.get(idx);
   if (existing) {
     existing.replaceWith(card);
@@ -202,8 +259,21 @@ async function readStoredResults() {
   return collectResults(raw);
 }
 
+// One full read that also carries what the results cannot say on their own:
+// which URLs were submitted, and whether the run finished them all.
+async function readSnapshot() {
+  const raw = await chrome.storage.local.get(null);
+  const results = collectResults(raw);
+  const meta = metaFromStorage(raw);
+  return {
+    results,
+    meta,
+    completeness: completenessOf(meta, Object.keys(results))
+  };
+}
+
 // Renders the audit summary with textContent only (entries may carry untrusted strings).
-function renderStats(summary) {
+function renderStats(summary, diagnosis, completeness) {
   statsEl.innerHTML = '';
   function row(label, value) {
     const div = document.createElement('div');
@@ -230,6 +300,27 @@ function renderStats(summary) {
     `${summary.byTemplate.new} / ${summary.byTemplate.old}${summary.byTemplate.unknown ? ` (+${summary.byTemplate.unknown} sin dato)` : ''}`);
   row('Con FMC.context', `${summary.fmcContext.with} / ${summary.total}`);
   row('Con beacon Adobe', `${summary.aaBeacon.with} / ${summary.total}`);
+  if (completeness) {
+    // Never let the report look complete when it is not: a cancelled run drops
+    // the captures that were in flight and no other row would show it.
+    if (completeness.complete) {
+      row('Medici\u00f3n', `${completeness.captured}/${completeness.expectedTotal} URLs (completa)`);
+    } else {
+      row('Medici\u00f3n',
+        `${completeness.captured}/${completeness.expectedTotal} URLs` +
+        `${completeness.cancelled ? ' \u00b7 CORRIDA CANCELADA' : ''}` +
+        ` \u00b7 sin medir: ${completeness.notCaptured}`);
+    }
+  }
+  if (diagnosis) {
+    row('Con problemas', `${diagnosis.withProblems} / ${diagnosis.total}`);
+    row('Problemas de sitio (alta/media/baja)',
+      `${diagnosis.bySiteSeverity.high} / ${diagnosis.bySiteSeverity.medium} / ${diagnosis.bySiteSeverity.low}`);
+    const topCode = Object.keys(diagnosis.byCode)
+      .map((code) => ({ code, count: diagnosis.byCode[code] }))
+      .sort((a, b) => b.count - a.count)[0];
+    if (topCode) row('Código más frecuente', `${topCode.code} ×${topCode.count}`);
+  }
   summary.topErrors.forEach((e) => row(`Top error ×${e.count}`, e.message));
   if (summary.byStatus.error > 0) {
     const btn = document.createElement('button');
@@ -275,13 +366,15 @@ function closeErrorModal() {
 }
 
 document.getElementById('downloadSummary').addEventListener('click', async () => {
-  const raw = await chrome.storage.local.get(null);
-  const summary = buildSummary(orderedResults(collectResults(raw)), {
-    startedAt: raw.ddStartedAt,
-    finishedAt: raw.ddFinishedAt
+  const snap = await readSnapshot();
+  const summary = buildSummary(orderedResults(snap.results), {
+    startedAt: snap.meta.startedAt,
+    finishedAt: snap.meta.finishedAt
   }, classifyEnv);
   summary.generatedAt = new Date().toISOString();
-  summary.expectedTotal = raw.ddTotal || summary.total;
+  summary.expectedTotal = snap.completeness.expectedTotal;
+  summary.completeness = snap.completeness;
+  summary.extensionVersion = extensionVersion();
   const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -314,6 +407,26 @@ document.getElementById('downloadDD').addEventListener('click', async () => {
 document.getElementById('downloadAA').addEventListener('click', async () => {
   const results = await readStoredResults();
   downloadFile(`digitalData-aa-${Date.now()}.json`, buildAAJson(results));
+});
+
+document.getElementById('downloadDiagnosis').addEventListener('click', async () => {
+  const snap = await readSnapshot();
+  const items = orderedResults(snap.results).map(({ idx, entry }) => Object.assign({}, entry, { index: idx }));
+  const diagnoses = diagnoseEntries(items, DIAG_OPTIONS);
+  downloadFile(`digitalData-problemas-${Date.now()}.json`, {
+    generatedAt: new Date().toISOString(),
+    // When the run happened, next to when the diagnosis was produced: a report
+    // without its own date cannot be defended months later.
+    runStartedAt: snap.meta.startedAt || null,
+    runFinishedAt: snap.meta.finishedAt || null,
+    extensionVersion: extensionVersion(),
+    rulesVersion: RULES_VERSION,
+    // What was submitted versus what produced an entry. Without this the report
+    // cannot tell a finished run from one that was cancelled mid-queue.
+    completeness: snap.completeness,
+    summary: summarizeDiagnosis(diagnoses),
+    results: diagnoses
+  });
 });
 
 document.getElementById('copyJson').addEventListener('click', async () => {

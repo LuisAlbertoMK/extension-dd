@@ -1,79 +1,107 @@
-// Contract test: the JSON this extension exports must satisfy the schema that
-// downstream importers (e.g. MYCO pipeline step 5) rely on. Run with: npm test
 const { describe, it } = require('node:test');
-const assert = require('node:assert/strict');
-const { buildCombinedJson } = require('../lib/results.js');
-const { buildDDJson, buildAAJson } = require('../lib/results.js');
-const { validateExport, validateDDExport, validateAAExport, EXPORT_STATUS } = require('../lib/schema.js');
+const assert = require('node:assert');
+const { buildContract, checkExport, commonPrefix } = require('../lib/contract.js');
 
-function sampleResults() {
+function page(overrides) {
   return {
-    '0__https://shop.example/mustang': {
-      url: 'https://shop.example/mustang', status: 'ok',
-      digitalData: { page: { pageName: 'mustang' } },
-      adobeAnalytics: { s: { pageName: 'mustang' }, satellite: { environment: 'production' }, dataLayer: null },
-      error: null, truncated: false
-    },
-    '1__https://shop.example/mustang': {
-      url: 'https://shop.example/mustang', status: 'ok',
-      digitalData: { page: { pageName: 'mustang' } },
-      adobeAnalytics: null, error: null, truncated: false
-    },
-    '2__https://preview.example/draft': {
-      url: 'https://preview.example/draft', status: 'no-data',
-      digitalData: null, adobeAnalytics: null, error: null, truncated: false
-    },
-    '3__https://broken.example/': {
-      url: 'https://broken.example/', status: 'error',
-      digitalData: null, adobeAnalytics: null, error: 'Timed out waiting for page load', truncated: false
-    }
+    siteSection: 'help',
+    client: 'lincoln mexico',
+    site: 'lincoln-brand',
+    radUIVersion: 'ui:rad:pc',
+    userLanguage: 'esp',
+    hierarchy: 'help:a',
+    pageName: 'help:a',
+    pageNameNoVehicle: 'help:a',
+    variantName: 'global-load',
+    ...(overrides || {})
   };
 }
 
-describe('export contract', () => {
-  it('a realistic export validates clean', () => {
-    assert.deepEqual(validateExport(buildCombinedJson(sampleResults())), []);
+function entry(index, pageOverrides, extra) {
+  return {
+    index,
+    url: `https://www.lincoln.mx/help/${index}/`,
+    status: 'ok',
+    digitalData: { page: page(pageOverrides) },
+    ...(extra || {})
+  };
+}
+
+const three = () => [
+  entry(0),
+  entry(1, { pageName: 'help:b', pageNameNoVehicle: 'help:b', hierarchy: 'help:b' }),
+  entry(2, { pageName: 'help:c', pageNameNoVehicle: 'help:c', hierarchy: 'help:c' })
+];
+
+describe('buildContract', () => {
+  it('turns a constant field into a literal and a varying name into a prefix', () => {
+    const contract = buildContract(three());
+    assert.deepEqual(Object.keys(contract.groups), ['help']);
+    assert.equal(contract.groups.help.sample, 3);
+    assert.deepEqual(contract.groups.help.fields.client, { kind: 'literal', value: 'lincoln mexico', coverage: 1 });
+    assert.deepEqual(contract.groups.help.fields.pageName, { kind: 'prefix', prefix: 'help:', coverage: 1 });
   });
 
-  it('documents the agreed status enum', () => {
-    assert.deepEqual(EXPORT_STATUS, ['ok', 'no-data', 'error', 'pending']);
+  it('leaves a field that is empty on part of the group out of the contract', () => {
+    // The bug this pins: a value carried by 3 of 4 pages is template variance.
+    // Turning it into a rule blames the fourth page for the template's shape.
+    const entries = three().concat([entry(3, { variantName: '' })]);
+    const contract = buildContract(entries);
+    assert.equal(contract.groups.help.fields.variantName, undefined);
+    assert.equal(contract.groups.help.fields.client.kind, 'literal');
   });
 
-  it('rejects missing fields, bad enums and out-of-order items', () => {
-    const [okEntry, ...rest] = buildCombinedJson(sampleResults());
-    const { index, ...withoutIndex } = okEntry;
-    assert.ok(validateExport([withoutIndex]).some((v) => v.includes('missing required field "index"')));
-    assert.ok(validateExport([{ ...okEntry, status: 'weird' }]).some((v) => v.includes('.status')));
-    assert.ok(validateExport([{ ...okEntry, truncated: 'yes' }]).some((v) => v.includes('.truncated')));
-    assert.ok(validateExport([...rest, okEntry]).some((v) => v.includes('out of order')));
-    assert.ok(validateExport([{ ...okEntry, adobeAnalytics: 'nope' }]).some((v) => v.includes('.adobeAnalytics')));
+  it('drops a group with fewer pages than minSample', () => {
+    const entries = three().concat([
+      entry(4, { siteSection: 'vehicle', pageName: 'vehicle:x' }),
+      entry(5, { siteSection: 'vehicle', pageName: 'vehicle:y' })
+    ]);
+    const contract = buildContract(entries, { minSample: 3 });
+    assert.equal(contract.groups.vehicle, undefined);
+    assert.deepEqual(contract.dropped.map((item) => item.group), ['vehicle']);
   });
 
-  it('rejects non-object items and mistyped payload fields', () => {
-    const [okEntry] = buildCombinedJson(sampleResults());
-    assert.ok(validateExport([null]).some((v) => v.includes('must be an object')));
-    assert.ok(validateExport([{ ...okEntry, digitalData: 42 }]).some((v) => v.includes('.digitalData')));
-    assert.ok(validateExport([{ ...okEntry, error: 5 }]).some((v) => v.includes('.error')));
-    assert.ok(validateExport([{ ...okEntry, url: '' }]).some((v) => v.includes('.url')));
-  });
-
-  it('rejects non-array payloads', () => {
-    assert.deepEqual(validateExport({}), ['export must be an array']);
+  it('ignores entries without a captured data layer', () => {
+    const entries = three().concat([{ index: 9, url: 'https://www.ford.mx/x/', status: 'no-data', digitalData: null }]);
+    const contract = buildContract(entries);
+    assert.equal(contract.skippedEntries, 1);
+    assert.equal(contract.groups.help.sample, 3);
   });
 });
 
-describe('split-view contracts', () => {
-  it('DD and AA exports validate against their own contracts', () => {
-    const results = sampleResults();
-    assert.deepEqual(validateDDExport(buildDDJson(results)), []);
-    assert.deepEqual(validateAAExport(buildAAJson(results)), []);
+describe('checkExport', () => {
+  it('produces no findings against the export it was derived from', () => {
+    const entries = three();
+    const contract = buildContract(entries);
+    assert.deepEqual(checkExport(entries, contract).results, []);
   });
 
-  it('split views reject foreign payloads', () => {
-    const results = sampleResults();
-    const [ddEntry] = buildDDJson(results);
-    const [aaEntry] = buildAAJson(results);
-    assert.ok(validateAAExport([ddEntry]).some((v) => v.includes('missing required field "adobeAnalytics"')));
-    assert.ok(validateDDExport([aaEntry]).some((v) => v.includes('missing required field "digitalData"')));
+  it('flags a wrong literal, a wrong prefix and a missing value', () => {
+    const entries = three();
+    const contract = buildContract(entries);
+    const drifted = [
+      entry(10, { client: 'ford-mexico' }),
+      entry(11, { pageName: 'promotions:x' }),
+      entry(12, { site: '' })
+    ];
+    const report = checkExport(drifted, contract);
+    assert.equal(report.results.length, 3);
+    const codes = report.results.map((item) => item.problems[0].code);
+    assert.deepEqual(codes, ['contract-value', 'contract-prefix', 'contract-missing']);
+  });
+
+  it('does not evaluate a page whose group has no contract', () => {
+    const contract = buildContract(three());
+    const report = checkExport([entry(20, { siteSection: 'unknown' })], contract);
+    assert.deepEqual(report.results, []);
+    assert.deepEqual(report.ungrouped, [20]);
+  });
+});
+
+describe('commonPrefix', () => {
+  it('cuts back to a token boundary instead of a partial token', () => {
+    assert.equal(commonPrefix(['help:terms and conditions', 'help:privacy']), 'help:');
+    assert.equal(commonPrefix(['promotions', 'promotions:x']), 'promotions');
+    assert.equal(commonPrefix(['cpo:a', 'promotions:b']), '');
   });
 });
