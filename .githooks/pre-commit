@@ -1,0 +1,3 @@
+#!/bin/sh
+# Versioned guard: config.local.js and its values never reach the index.
+exec node tools/check-secrets.js
