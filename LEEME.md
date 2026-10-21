@@ -119,6 +119,7 @@ diagnosticar sin crawlear el sitio otra vez.
 | `locale-mismatch` | medium | site | `metrics_locale` no corresponde al país del host |
 | `auth-wall` | medium | env | Redirigió a un IdP: la página pedida nunca se vio |
 | `not-found` | medium | env | HTTP 404/410: la URL ya no existe en ese entorno |
+| `request-rejected` | high | env | HTTP 431/414: el servidor rechazó la *petición* (headers demasiado grandes); la página nunca corrió |
 | `invalid-status` | medium | tool | Estado fuera del enum del contrato |
 | `incomplete-entry` | medium | tool | El entry no trae `adobeAnalytics`: AA nunca se midió |
 | `redirect` | low | env | El DD pertenece a `finalUrl`, no a la URL pedida |
@@ -131,6 +132,14 @@ Ningún veredicto `site` se deriva de evidencia incompleta: un entry truncado, u
 URL pendiente, un estado inválido, un payload ilegible o un export sin AA producen
 solo problemas `tool`. Antes cada uno de esos casos se reportaba como defecto del
 sitio de severidad alta.
+
+Tampoco se deriva de una página que no llegó a servirse. `edge-blocked` (403/429),
+`server-error` (5xx), `not-found` (404/410) y `request-rejected` (431/414) son
+`env`. El último se agregó tras medirlo: cinco URLs de `ford.com.pr` respondieron
+**431** en una corrida (y 404 en la anterior) tras esperar los ~8 s de captura.
+Un 431 rechaza la petición por headers demasiado grandes, así que no hay
+documento y nada que decir del data layer: era nuestro perfil de request, no el
+sitio.
 
 Los campos obligatorios son datos, no código: se pueden cambiar por plantilla con
 `diagnoseEntry(entry, { requiredFields: [...] })` cuando el cliente fije el
@@ -219,7 +228,7 @@ hizo la corrida no producía ese campo" se ven idénticos, y esa ambigüedad ya
 costó una corrida.
 
 - `manifest.json` es la versión de la extensión y se sube con **cada cambio de
-  comportamiento** (hoy `1.1.2`). El export de resumen y el de problemas llevan
+  comportamiento** (hoy `1.1.3`). El export de resumen y el de problemas llevan
   `extensionVersion`: si un export nuevo no lo trae, la recarga no tomó.
 - El export de problemas lleva además `rulesVersion` (constante `RULES_VERSION`
   en `lib/diagnose.js`). Se sube cuando una regla cambia el significado de un
@@ -265,7 +274,7 @@ Por eso el sobre de problemas y el de resumen llevan `completeness`:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 196 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 197 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,
