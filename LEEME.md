@@ -285,7 +285,7 @@ Por eso el sobre de problemas y el de resumen llevan `completeness`:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 199 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 204 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,
@@ -300,6 +300,21 @@ El `test/contract.test.js` valida el schema que consumen importadores externos
 ( p. ej. MYCO paso 5): si cambia el export, el contrato falla explícito en vez de
 romper la auditoría en silencio.
 
-## Configuración local (Ford AEM, opcional)1. Copia `config.example.js` a `config.local.js` (ese archivo está en `.gitignore` y nunca se sube).
+## Configuración local (Ford AEM, opcional)
+
+1. Copia `config.example.js` a `config.local.js` (ese archivo está en `.gitignore` y nunca se sube).
 2. Completa tus valores reales (`edgeValue`, `cookieValue`).
 3. Recarga la extensión. Sin ese archivo, el bypass de Ford queda desactivado y todo lo demás funciona igual.
+
+Ese archivo es el único lugar donde vive la credencial. Un `.env` no aplica acá:
+un service worker no tiene `process.env` ni hay build step, y el valor inyectado
+igual tendría que existir en disco. El riesgo real no es el formato sino un
+`git add -A` con el archivo de por medio.
+
+Por eso hay un guard versionado. Se activa una vez con `git config core.hooksPath
+.githooks`; desde ahí `.githooks/pre-commit` corre `npm run check:secrets` y rechaza
+el commit si el índice incluye `config.local.js`, cualquier `.env`, o cualquier
+contenido que traiga un valor leído de `config.local.js`. El guard no almacena el
+secreto: lo lee del archivo en el momento del check, así que rotar la key no
+requiere tocar código ni volver a commitear nada.
+
