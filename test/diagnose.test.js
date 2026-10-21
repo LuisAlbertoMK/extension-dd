@@ -115,6 +115,18 @@ describe('diagnoseEntry — evidence quality (no false site blame)', () => {
     assert.deepEqual(codes(diagnosis), ['dd-missing']);
   });
 
+  it('treats a rejected request as environment, not as a missing data layer', () => {
+    // Measured: five ford.com.pr sitemap siblings answered 431 (request headers
+    // too large) and waited the full capture timeout without a document. The
+    // previous run served them 404, so this is our request profile, not the site.
+    [431, 414].forEach((status) => {
+      const diagnosis = diagnoseEntry(noData({ http_status: status }));
+      assert.equal(diagnosis.siteSeverity, 'none');
+      assert.deepEqual(codes(diagnosis), ['request-rejected']);
+      assert.equal(find(diagnosis, 'request-rejected').attribution, 'env');
+    });
+  });
+
   it('does not infer AA absence from an export that never measured it', () => {
     const withoutAA = entry();
     delete withoutAA.adobeAnalytics;
