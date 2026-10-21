@@ -140,9 +140,11 @@ Tampoco se deriva de una página que no llegó a servirse. `edge-blocked` (403/4
 `server-error` (5xx), `not-found` (404/410) y `request-rejected` (431/414) son
 `env`. El último se agregó tras medirlo: cinco URLs de `ford.com.pr` respondieron
 **431** en una corrida (y 404 en la anterior) tras esperar los ~8 s de captura.
-Un 431 rechaza la petición por headers demasiado grandes, así que no hay
-documento y nada que decir del data layer: era nuestro perfil de request, no el
-sitio.
+Un 431 rechaza la petición antes de servir documento, así que no hay nada que
+decir del data layer. La causa no es nuestra: el perfil de medición no tiene
+cookies de `ford.com.pr` y la extensión no inyecta headers en ese dominio (el
+bypass AEM solo aplica a `wwwac.*.brand*.ford.com`). Que las mismas URLs
+respondan 404 o 431 según la corrida ubica la decisión del lado del edge.
 
 Los tres 404 de Lincoln quedan además fuera de `missing-required`: su shell llega
 con `pageName`, `hierarchy` y `siteSection` vacíos porque es la plantilla de error,
