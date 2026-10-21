@@ -95,18 +95,44 @@ describe('diagnoseEntry — evidence quality (no false site blame)', () => {
     assert.deepEqual(codes(gone), ['not-found']);
   });
 
-  it('does not blame a 404 page that still served a data-layer shell', () => {
+  it('does not blame a 404 page for the fields a dead URL cannot have', () => {
     // Measured: the three Lincoln /promociones/* URLs answer 404 with a shell
     // that has page.descriptor/tool but no pageName. Reading that as a site
     // defect is blaming a page that does not exist for not describing itself.
+    // What survives is the template defect (a beacon with no pageName).
     const diagnosis = diagnoseEntry(entry({
       status: 'ok',
       http_status: 404,
       digitalData: { page: { descriptor: 'none', tool: 'none', userLanguage: '' } },
       adobeAnalytics: { s: { pageName: 'lincoln:404' }, satellite: null, dataLayer: null }
     }));
-    assert.equal(diagnosis.siteSeverity, 'none');
-    assert.deepEqual(codes(diagnosis), ['not-found']);
+    assert.equal(find(diagnosis, 'missing-required'), undefined);
+    assert.equal(find(diagnosis, 'dd-missing'), undefined);
+    assert.deepEqual(codes(diagnosis), ['error-page-no-pagename', 'not-found']);
+  });
+
+  it('reports the instrumented error template as one medium site defect', () => {
+    const diagnosis = diagnoseEntry(entry({
+      http_status: 404,
+      digitalData: { page: { client: 'lincoln mexico', pageName: '', hierarchy: '', site: 'lincoln-brand' } },
+      adobeAnalytics: { s: { account: 'fordmxlincolnprod' }, satellite: null, dataLayer: null }
+    }));
+    const item = find(diagnosis, 'error-page-no-pagename');
+    assert.equal(item.severity, 'medium');
+    assert.equal(item.attribution, 'site');
+    assert.equal(item.field, 'page.pageName');
+    assert.equal(diagnosis.siteSeverity, 'medium');
+  });
+
+  it('leaves a 404 alone when the error page names itself or nothing is instrumented', () => {
+    const named = diagnoseEntry(entry({
+      http_status: 404,
+      digitalData: { page: { pageName: 'error:404' } }
+    }));
+    assert.deepEqual(codes(named), ['not-found']);
+
+    const bare = diagnoseEntry(noData({ http_status: 404 }));
+    assert.deepEqual(codes(bare), ['not-found']);
   });
 
   it('still reports a real absence when the page answered 200', () => {

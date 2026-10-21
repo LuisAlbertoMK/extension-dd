@@ -119,6 +119,7 @@ diagnosticar sin crawlear el sitio otra vez.
 | `locale-mismatch` | medium | site | `metrics_locale` no corresponde al país del host |
 | `auth-wall` | medium | env | Redirigió a un IdP: la página pedida nunca se vio |
 | `not-found` | medium | env | HTTP 404/410: la URL ya no existe en ese entorno |
+| `error-page-no-pagename` | medium | site | La plantilla de error 404 está instrumentada y manda un page view de AA con `pageName` vacío |
 | `request-rejected` | high | env | HTTP 431/414: el servidor rechazó la *petición* (headers demasiado grandes); la página nunca corrió |
 | `invalid-status` | medium | tool | Estado fuera del enum del contrato |
 | `incomplete-entry` | medium | tool | El entry no trae `adobeAnalytics`: AA nunca se midió |
@@ -140,6 +141,16 @@ Tampoco se deriva de una página que no llegó a servirse. `edge-blocked` (403/4
 Un 431 rechaza la petición por headers demasiado grandes, así que no hay
 documento y nada que decir del data layer: era nuestro perfil de request, no el
 sitio.
+
+Los tres 404 de Lincoln quedan además fuera de `missing-required`: su shell llega
+con `pageName`, `hierarchy` y `siteSection` vacíos porque es la plantilla de error,
+y pedirle identidad a una página que no existe era doble conteo. Lo que sí se
+reporta, como un defecto `site` medium por URL, es que esa plantilla dispara el
+beacon de AA con `pageName` vacío: los tres payloads eran idénticos salvo la URL
+(mismo `client`, `site`, `radUIVersion`, mismo `prop17` de otro vehículo), así que
+es un fix de plantilla, no tres defectos de página. El 404 de `ford.com.pr`
+(`title: "File not found"`, sin DD ni beacon) no dispara nada: ahí no hay
+instrumentación que corregir.
 
 Los campos obligatorios son datos, no código: se pueden cambiar por plantilla con
 `diagnoseEntry(entry, { requiredFields: [...] })` cuando el cliente fije el
@@ -228,7 +239,7 @@ hizo la corrida no producía ese campo" se ven idénticos, y esa ambigüedad ya
 costó una corrida.
 
 - `manifest.json` es la versión de la extensión y se sube con **cada cambio de
-  comportamiento** (hoy `1.1.3`). El export de resumen y el de problemas llevan
+  comportamiento** (hoy `1.1.4`). El export de resumen y el de problemas llevan
   `extensionVersion`: si un export nuevo no lo trae, la recarga no tomó.
 - El export de problemas lleva además `rulesVersion` (constante `RULES_VERSION`
   en `lib/diagnose.js`). Se sube cuando una regla cambia el significado de un
@@ -274,7 +285,7 @@ Por eso el sobre de problemas y el de resumen llevan `completeness`:
 
 ## Tests (node, sin dependencias)
 Las funciones puras viven en `lib/` y se prueban con el runner nativo:
-- `npm test` — 197 tests (urls, formato, resultados, quota, estado de carga,
+- `npm test` — 199 tests (urls, formato, resultados, quota, estado de carga,
   contrato de export, reglas y CLI del diagnóstico, comparador de diagnósticos,
   reglas y CLI del comparador de resúmenes, y un arnés de integración de
   `background.js` con la API de Chrome simulada: layout por URL, reanudación,
