@@ -1,2 +1,5 @@
 # Local-only secrets (see config.example.js)
 config.local.js
+
+# Local tooling noise
+.atl/

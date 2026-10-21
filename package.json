@@ -1,0 +1,11 @@
+{
+  "name": "digitaldata-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome MV3 extension: bulk window.digitalData + Adobe Analytics snapshot extractor",
+  "scripts": {
+    "test": "node --test test/",
+    "parity": "node tools/parity-check.js"
+  },
+  "license": "UNLICENSED"
+}

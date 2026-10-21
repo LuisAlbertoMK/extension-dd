@@ -1,5 +1,6 @@
 // Optional local overrides (untracked). Copy config.example.js to config.local.js.
 try { importScripts('config.local.js'); } catch (e) { /* no local config: Ford bypass stays disabled */ }
+importScripts('lib/quota.js'); // capEntry (pure, also covered by node tests)
 
 // Tiempo extra tras "complete" para dejar que scripts async (analytics) definan digitalData
 const POST_LOAD_WAIT_MS = 1500;
@@ -15,6 +16,12 @@ const CONCURRENCY = 5;
 const TAB_LOAD_TIMEOUT_MS = 25000;
 // Per-entry cap so a single huge digitalData payload cannot blow the storage quota.
 const MAX_ENTRY_BYTES = 256 * 1024;
+
+// --- Throughput tuning (calibrate with real runs, e.g. 368 URLs in 12m05s) ---
+// Blocking images/media/fonts while a job runs cuts load time without
+// affecting data layers (scripts, XHR and documents are never blocked).
+const BLOCK_HEAVY_RESOURCES = true;
+const PERF_DNR_RULE_ID = 10;
 
 // Ford AEM bypass: header + cookie required so wwwac.*.brand*.ford.com pages load instead of blocking.
 const FORD_URL_REGEX = /^https:\/\/wwwac\..*\.brand.*\.ford\.com\/.*/i;
@@ -114,6 +121,36 @@ async function ensureFordCookie(url) {
 
 // ---- Job lifecycle ----
 
+// Enables/disables the heavy-resource block while a job runs. Dynamic rules
+// persist across service-worker restarts, so every enable path has a matching
+// disable (finalize, cancel, worker startup).
+async function ensurePerfRules(enable) {
+  try {
+    if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
+    if (enable && BLOCK_HEAVY_RESOURCES) {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [PERF_DNR_RULE_ID],
+        addRules: [{
+          id: PERF_DNR_RULE_ID,
+          priority: 1,
+          action: { type: 'block' },
+          condition: {
+            urlFilter: '|http*',
+            resourceTypes: ['image', 'media', 'font']
+          }
+        }]
+      });
+    } else {
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: [PERF_DNR_RULE_ID],
+        addRules: []
+      });
+    }
+  } catch (e) {
+    console.warn('DigitalData: failed to update perf rules', e);
+  }
+}
+
 async function startJob(urls) {
   if (activeJob) return { ok: false, reason: 'already-running' };
   if (!Array.isArray(urls) || !urls.length) return { ok: false, reason: 'no-urls' };
@@ -176,6 +213,7 @@ function launchJob(job) {
 async function finalizeJob(job, openResults) {
   if (activeJob === job) activeJob = null;
   const cancelled = job.handle.cancelled;
+  await ensurePerfRules(false).catch(() => {});
 
   // Drop any pending throttled flush and persist the final accumulated snapshot
   // so a late suspend cannot lose the last batch of results.
@@ -235,6 +273,7 @@ function firstIncompleteIndex(urls, results) {
 async function runQueue(job) {
   const { record, handle } = job;
   const urls = record.urls;
+  await ensurePerfRules(true).catch(() => {});
 
   function claim() {
     while (record.nextIndex < urls.length) {
@@ -266,7 +305,7 @@ async function runQueue(job) {
 }
 
 async function processUrl(url, idx, job) {
-  const entry = { url, status: 'pending', digitalData: null, error: null, truncated: false };
+  const entry = { url, finalUrl: null, status: 'pending', digitalData: null, adobeAnalytics: null, error: null, truncated: false };
   let tab;
 
   try {
@@ -274,18 +313,41 @@ async function processUrl(url, idx, job) {
     tab = await chrome.tabs.create({ url, active: false });
     trackTab(job, tab.id);
     await waitForTabComplete(tab.id, TAB_LOAD_TIMEOUT_MS);
+    // Capture the post-redirect URL: the data layer belongs to THIS page,
+    // which may differ from the requested URL (locale/preview redirects,
+    // chrome-error pages). Best effort; stays null if the tab is gone.
+    try {
+      const current = await chrome.tabs.get(tab.id);
+      if (current && current.url) entry.finalUrl = current.url;
+    } catch (e) { /* tab already gone */ }
     await sleep(POST_LOAD_WAIT_MS);
 
     const injection = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      world: 'MAIN', // el mundo "MAIN" comparte el window real de la página, donde vive digitalData
-      func: extractDigitalData,
+      world: 'MAIN', // MAIN world shares the page real window where digitalData and Adobe objects live
+      func: extractPageAnalytics,
       args: [DIGITALDATA_MAX_WAIT_MS, DIGITALDATA_POLL_INTERVAL_MS]
     });
 
-    const result = injection && injection[0] ? injection[0].result : null;
-    entry.digitalData = result;
-    entry.status = result ? 'ok' : 'no-data';
+    const payload = injection && injection[0] ? injection[0].result : null;
+    if (!payload || typeof payload !== 'object') {
+      entry.status = 'no-data';
+    } else {
+      const dd = payload.dd !== undefined ? payload.dd : null;
+      const aa = payload.aa !== undefined ? payload.aa : null;
+      const hasAA = !!(aa && (aa.s || aa.satellite || aa.dataLayer));
+      if (!dd && !hasAA) {
+        entry.status = 'no-data';
+      } else {
+        entry.digitalData = dd;
+        entry.adobeAnalytics = hasAA ? aa : null;
+        entry.status = 'ok';
+        const capped = capEntry(entry, MAX_ENTRY_BYTES);
+        entry.digitalData = capped.digitalData;
+        entry.adobeAnalytics = capped.adobeAnalytics;
+        entry.truncated = capped.truncated;
+      }
+    }
   } catch (e) {
     entry.status = 'error';
     entry.error = e && e.message ? e.message : String(e);
@@ -435,24 +497,11 @@ function storageSet(items) {
   });
 }
 
-// Cap a single result entry so one huge payload cannot exhaust the storage quota.
-function capEntry(entry, maxBytes) {
-  let serialized = '';
-  try {
-    serialized = JSON.stringify(entry.digitalData);
-  } catch (e) {
-    serialized = '';
-  }
-  if (serialized && serialized.length > maxBytes) {
-    entry.digitalData = serialized.slice(0, maxBytes);
-    entry.truncated = true;
-  }
-  return entry;
-}
+// capEntry is provided by lib/quota.js (imported at the top of this worker).
 
 // Esta función se inyecta y se ejecuta DENTRO de la página, no en la extensión.
 // Debe ser autocontenida (sin referencias externas).
-function extractDigitalData(maxWaitMs, intervalMs) {
+function extractPageAnalytics(maxWaitMs, intervalMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     // Algunos sitios exponen la variable como "digitalData" (estándar GTM/Adobe)
@@ -463,6 +512,8 @@ function extractDigitalData(maxWaitMs, intervalMs) {
     // references we depend on up front instead of trusting them at use time.
     const safeStringify = JSON.stringify;
     const safeIsArray = Array.isArray;
+    // Scalar AppMeasurement fields worth keeping; functions and huge internals are dropped.
+    const sFieldPattern = /^(account|pageName|channel|server|pageType|campaign|products|events|purchaseID|transactionID|state|zip|hier\d+|eVar\d+|prop\d+|list\d+|pev\d*|pe)$/;
 
     function sanitize(value, depth, stack) {
       if (depth > 20) throw new Error('digitalData is nested too deeply');
@@ -496,29 +547,85 @@ function extractDigitalData(maxWaitMs, intervalMs) {
 
     function check() {
       const foundName = candidateNames.find((name) => typeof window[name] !== 'undefined');
+      let dd = null;
       if (foundName) {
         try {
           const raw = window[foundName];
-          if (raw === null || typeof raw !== 'object') {
-            resolve(null); // not a digitalData object: keep the typed contract
-            return;
+          if (raw !== null && typeof raw === 'object') {
+            const clone = sanitize(raw, 0, []);
+            if (clone !== null && typeof clone === 'object') {
+              // Validate that the captured serializer can represent the clone.
+              safeStringify(clone);
+              dd = clone;
+            }
           }
-          const clone = sanitize(raw, 0, []);
-          if (clone === null || typeof clone !== 'object') {
-            resolve(null);
-            return;
-          }
-          // Validate that the captured serializer can represent the clone.
-          safeStringify(clone);
-          resolve(clone);
         } catch (e) {
-          resolve(null); // never leak an __error object into the results contract
+          dd = null; // never leak an __error object into the results contract
         }
+      }
+      if (dd) {
+        resolve({ dd: dd, aa: collectAdobe() });
       } else if (Date.now() - start > maxWaitMs) {
-        resolve(null);
+        resolve({ dd: null, aa: collectAdobe() });
       } else {
         setTimeout(check, intervalMs);
       }
+    }
+
+    // Snapshot of Adobe Analytics state: AppMeasurement summary, Launch metadata
+    // and adobeDataLayer events. Best effort; returns null when nothing is found.
+    function collectAdobe() {
+      let s = null;
+      let satellite = null;
+      let dataLayer = null;
+      try {
+        const sRaw = window.s;
+        if (sRaw && typeof sRaw === 'object') {
+          const out = {};
+          const keys = Object.keys(sRaw);
+          for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (!sFieldPattern.test(k)) continue;
+            const v = sanitize(sRaw[k], 1, []);
+            if (v !== undefined && v !== '') out[k] = v;
+          }
+          if (Object.keys(out).length) s = out;
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const sat = window._satellite;
+        if (sat && typeof sat === 'object') {
+          const info = {};
+          try {
+            if (sat.property && sat.property.name) info.property = String(sat.property.name);
+          } catch (e) { /* ignore */ }
+          try {
+            if (sat.environment && sat.environment.stage) info.environment = String(sat.environment.stage);
+          } catch (e) { /* ignore */ }
+          try {
+            if (sat.buildInfo && typeof sat.buildInfo === 'object') {
+              const b = sanitize(sat.buildInfo, 0, []);
+              if (b && typeof b === 'object') info.buildInfo = b;
+            }
+          } catch (e) { /* ignore */ }
+          if (Object.keys(info).length) satellite = info;
+        }
+      } catch (e) { /* ignore */ }
+      try {
+        const adl = window.adobeDataLayer;
+        if (adl && typeof adl.length === 'number') {
+          const clean = sanitize(Array.prototype.slice.call(adl), 0, []);
+          if (safeIsArray(clean) && clean.length) {
+            dataLayer = {
+              totalEvents: clean.length,
+              events: clean.length > 50 ? clean.slice(0, 50) : clean,
+              truncatedEvents: clean.length > 50
+            };
+          }
+        }
+      } catch (e) { /* ignore */ }
+      if (!s && !satellite && !dataLayer) return null;
+      return { s: s, satellite: satellite, dataLayer: dataLayer };
     }
 
     check();
@@ -528,3 +635,4 @@ function extractDigitalData(maxWaitMs, intervalMs) {
 // Attempt to resume an interrupted job when the worker (re)starts.
 maybeResume().catch(() => {});
 ensureFordRequestRules().catch(() => {});
+ensurePerfRules(false).catch(() => {}); // drop stale blocks from a killed run
